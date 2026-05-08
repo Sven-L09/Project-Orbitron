@@ -1,3 +1,10 @@
 .env
 __pycache__/
 *.pyc
+
+# Local runtime data
+.orbitron/
+
+# IDE settings
+.vscode/
+.claude/

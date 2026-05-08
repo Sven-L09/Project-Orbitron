@@ -1,8 +1,11 @@
 """Kernel Bridge - Connects Orchestrator with OrbitronKernel."""
 
+import logging
 import sys
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger("KernelBridge")
 
 # Add kernel to path
 kernel_path = Path(__file__).resolve().parents[2] / "OrbitronKernel"
@@ -25,7 +28,7 @@ class KernelBridge:
     
     def __init__(self, config_path: str | None = None, workspace_root: str | None = None):
         """Initialize both Kernel and Orchestrator."""
-        print("[KernelBridge] Initializing...")
+        logger.info("[KernelBridge] Initializing...")
         
         # Initialize Kernel (tools, Ollama, file operations)
         self.kernel = OrbitronKernel(config_path=config_path)
@@ -41,8 +44,8 @@ class KernelBridge:
             workspace_root=workspace_root or kernel_workspace
         )
         
-        print(f"[KernelBridge] Workspace: {kernel_workspace}")
-        print("[KernelBridge] Ready")
+        logger.info("[KernelBridge] Workspace: %s", kernel_workspace)
+        logger.info("[KernelBridge] Ready")
     
     def chat(self, user_input: str, chat_id: int | None = None) -> str:
         """Process a user message with full personality and tool access."""

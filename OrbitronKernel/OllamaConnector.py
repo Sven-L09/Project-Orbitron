@@ -1,5 +1,8 @@
+import concurrent.futures
 import json
 import os
+import queue
+import time
 from typing import Any
 
 import requests
@@ -8,7 +11,7 @@ import requests
 class OllamaConnector:
     API_BASE_URL_DEFAULT = "https://ollama.com/api"
     API_KEY_DEFAULT = ""  # Prefer env var/config; keep empty by default.
-    MODEL_DEFAULT = "kimi-k2.5:cloud"
+    MODEL_DEFAULT = "nemotron-3-super:cloud"
 
     def __init__(
         self,
@@ -20,6 +23,30 @@ class OllamaConnector:
         self.api_key = api_key or os.getenv("OLLAMA_API_KEY") or self.API_KEY_DEFAULT
         self.model = model
 
+    def _do_post(
+        self,
+        session: requests.Session,
+        url: str,
+        headers: dict[str, str],
+        payload: dict[str, Any],
+        stream: bool,
+        timeout: tuple[int, int],
+        result_queue: queue.Queue,
+        error_queue: queue.Queue,
+    ) -> None:
+        """Run the HTTP POST in a background thread."""
+        try:
+            response = session.post(
+                url,
+                headers=headers,
+                json=payload,
+                stream=stream,
+                timeout=timeout,
+            )
+            result_queue.put(response)
+        except Exception as e:
+            error_queue.put(e)
+
     def chat(
         self,
         messages: list[dict[str, Any]],
@@ -27,13 +54,23 @@ class OllamaConnector:
         tools: list[dict[str, Any]] | None = None,
         stream: bool = False,
         think: bool | str | None = None,
-        timeout_s: int = 180,
+        timeout_s: int = 3600,
+        max_retries: int = 3,
     ) -> dict[str, Any]:
-        """Call Ollama /api/chat.
+        """Call Ollama /api/chat with automatic retry on transient failures.
 
-        Returns the parsed response as a dict. If the server streams NDJSON,
-        the returned `message` is aggregated across chunks (content/thinking/tool_calls).
+        Uses a background thread with an absolute deadline to prevent
+        TCP-level hangs where requests' internal timeout does not trigger
+        (e.g. zombie connections on Windows).
+
+        Retries on: Timeout, ConnectionError, HTTP 5xx.
+        Does NOT retry on: HTTP 4xx (client errors), invalid JSON.
+
+        Returns the parsed response as a dict.
         """
+        import logging
+        logger = logging.getLogger("OllamaConnector")
+
         url = self._endpoint_url("chat")
         headers = {"Content-Type": "application/json"}
         if self.api_key:
@@ -49,18 +86,105 @@ class OllamaConnector:
         if think is not None:
             payload["think"] = think
 
-        # Cloud endpoints may return NDJSON even when stream=false.
-        response = requests.post(
-            url,
-            headers=headers,
-            json=payload,
-            stream=True,
-            timeout=(10, timeout_s),
-        )
-        response.raise_for_status()
-        return self._parse_ndjson_or_json_response(response)
+        last_error: Exception | None = None
 
-    def generate_response(self, prompt: str, *, timeout_s: int = 180) -> str:
+        for attempt in range(1, max_retries + 1):
+            start_time = time.time()
+            session = requests.Session()
+            result_queue: queue.Queue = queue.Queue()
+            error_queue: queue.Queue = queue.Queue()
+            thread: threading.Thread | None = None
+            try:
+                logger.info(
+                    "[Ollama] Sending chat request to %s (model=%s, timeout=%ds, messages=%d, attempt=%d/%d)",
+                    url, self.model, timeout_s, len(messages), attempt, max_retries,
+                )
+
+                import threading
+                thread = threading.Thread(
+                    target=self._do_post,
+                    args=(session, url, headers, payload, stream, (10, timeout_s), result_queue, error_queue),
+                    daemon=True,
+                )
+                thread.start()
+                thread.join(timeout=timeout_s)
+
+                if thread.is_alive():
+                    # Absolute deadline exceeded — the server (or a proxy) left the
+                    # connection open without sending data. Force-close the session.
+                    logger.warning(
+                        "[Ollama] Absolute deadline of %ds exceeded — force-closing connection (attempt %d/%d)",
+                        timeout_s, attempt, max_retries,
+                    )
+                    session.close()
+                    raise requests.exceptions.Timeout(
+                        f"Ollama request exceeded absolute deadline of {timeout_s}s"
+                    )
+
+                # Thread finished — check for errors first
+                if not error_queue.empty():
+                    raise error_queue.get()
+
+                # Thread finished successfully
+                response = result_queue.get()
+                response.raise_for_status()
+
+                if stream:
+                    result = self._parse_ndjson_or_json_response(response, deadline=start_time + timeout_s)
+                else:
+                    result = response.json()
+
+                elapsed = time.time() - start_time
+                content = str((result.get("message") or {}).get("content") or "")
+                logger.info(
+                    "[Ollama] Response received (%d chars, done=%s, elapsed=%.1fs, attempt=%d)",
+                    len(content), result.get("done", False), elapsed, attempt,
+                )
+                return result
+
+            except requests.exceptions.Timeout as e:
+                last_error = e
+                logger.warning(
+                    "[Ollama] Request timed out after %ds (attempt %d/%d)",
+                    timeout_s, attempt, max_retries,
+                )
+            except requests.exceptions.ConnectionError as e:
+                last_error = e
+                logger.warning(
+                    "[Ollama] Connection error: %s (attempt %d/%d)",
+                    e, attempt, max_retries,
+                )
+            except requests.exceptions.HTTPError as e:
+                status = e.response.status_code if e.response else 0
+                # 5xx = server error, retryable. 4xx = client error, don't retry.
+                if status >= 500:
+                    last_error = e
+                    logger.warning(
+                        "[Ollama] HTTP %d server error (attempt %d/%d)",
+                        status, attempt, max_retries,
+                    )
+                else:
+                    logger.error("[Ollama] HTTP %d client error — not retrying", status)
+                    raise RuntimeError(f"Ollama HTTP {status} error: {e}") from e
+            except Exception as e:
+                logger.error("[Ollama] Request failed: %s — not retrying", e)
+                raise RuntimeError(f"Ollama request failed: {e}") from e
+            finally:
+                session.close()
+
+            # Exponential backoff before retry: 2s, 4s, 8s...
+            if attempt < max_retries:
+                backoff = 2 ** attempt
+                logger.info("[Ollama] Retrying in %d seconds...", backoff)
+                time.sleep(backoff)
+
+        # All retries exhausted
+        logger.error("[Ollama] All %d attempts failed. Last error: %s", max_retries, last_error)
+        raise RuntimeError(
+            f"Ollama request failed after {max_retries} attempts. Last error: {last_error}"
+        ) from last_error
+
+    def generate_response(self, prompt: str, *, timeout_s: int = 3600) -> str:
         """Backward-compatible helper: one-turn chat returning assistant content."""
         resp = self.chat(
             [{"role": "user", "content": prompt}],
@@ -78,13 +202,22 @@ class OllamaConnector:
             return f"{base}/{endpoint.lstrip('/')}"
         return f"{base}/api/{endpoint.lstrip('/')}"
 
-    def _parse_ndjson_or_json_response(self, response: requests.Response) -> dict[str, Any]:
+    def _parse_ndjson_or_json_response(
+        self,
+        response: requests.Response,
+        deadline: float | None = None,
+    ) -> dict[str, Any]:
         aggregated_message: dict[str, Any] = {"role": "assistant", "content": ""}
         tool_calls: list[dict[str, Any]] = []
         raw_last_obj: dict[str, Any] | None = None
         saw_json = False
 
         for raw_line in response.iter_lines(decode_unicode=True):
+            if deadline is not None and time.time() > deadline:
+                logger = logging.getLogger("OllamaConnector")
+                logger.warning("[Ollama] Stream parsing aborted: deadline exceeded")
+                break
+
             if not raw_line:
                 continue
             line = raw_line.strip()

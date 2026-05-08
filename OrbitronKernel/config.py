@@ -33,7 +33,7 @@ class Config:
         return {
             "ollama": {
                 "base_url": "https://ollama.com/api",
-                "model": "kimi-k2.5:cloud",
+                "model": "nemotron-3-super:cloud",
                 "api_key": ""
             },
             "kernel": {

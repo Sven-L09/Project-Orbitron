@@ -1,4 +1,13 @@
-"""OrbitronSystem entrypoint (runs services forever)."""
+"""OrbitronSystem entrypoint (runs services forever).
+
+This is the main entry point for the Orbitron System.
+It initializes and runs all components including:
+- MessageBus for agent communication
+- Orchestrator for task management
+- Planner for planning
+- Kernel for code execution
+- TelegramBot for user interaction
+"""
 
 import os
 import sys
@@ -6,14 +15,14 @@ from pathlib import Path
 
 
 def _bootstrap_sys_path() -> None:
-    # Add project root so we can import OrbitronKernel.* when running as a script.
+    """Add project root to sys.path for imports."""
     root = Path(__file__).resolve().parents[1]
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
 
 
 def _load_dotenv() -> None:
-    """Minimal .env loader (key=value per line) without external deps."""
+    """Load environment variables from .env file."""
     candidate_paths: list[Path] = []
     try:
         candidate_paths.append(Path(__file__).resolve().parents[1] / ".env")
@@ -42,11 +51,19 @@ def _load_dotenv() -> None:
 
 
 def main() -> None:
+    """Main entry point."""
     _bootstrap_sys_path()
     _load_dotenv()
+    
+    # Import and start the ServiceSystem
     from OrbitronSystem.ServiceSystem import ServiceSystem
-
-    system = ServiceSystem()
+    
+    # Create and run service system
+    system = ServiceSystem(
+        enable_telegram=True,
+        max_planning_iterations=3,
+    )
+    
     system.run_forever()
 
 

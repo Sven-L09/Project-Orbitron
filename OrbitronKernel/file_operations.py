@@ -13,6 +13,11 @@ class FileOperations:
         """Initialize file operations."""
         self.workspace = str(Path(workspace or (Path.home() / ".orbitron" / "workspace")).resolve())
         os.makedirs(self.workspace, exist_ok=True)
+
+    @property
+    def workspace_root(self) -> Path:
+        """Return workspace root as a Path object for path joining."""
+        return Path(self.workspace)
     
     def read_file(self, path: str, encoding: str = "utf-8") -> str:
         """Read file content."""

@@ -12,6 +12,8 @@ from .message_types import (
     AgentRole,
     PlanningRequest,
     PlanningResponse,
+    TestingRequest,
+    TestingResponse,
     CommandMessage,
     CommandResult,
     StatusMessage,
@@ -29,14 +31,17 @@ from .agent_api import (
     OrchestratorCommunicator,
     PlannerCommunicator,
     ExecutorCommunicator,
+    TesterCommunicator,
     create_orchestrator_communicator,
     create_planner_communicator,
     create_executor_communicator,
+    create_tester_communicator,
     create_agent_communicator,
 )
 
 from .orchestrator_planner_bridge import OrchestratorPlannerBridge
 from .orchestrator_executor_bridge import OrchestratorExecutorBridge, ExecutorMessageHandler
+from .orchestrator_tester_bridge import OrchestratorTesterBridge, TesterMessageHandler
 
 __all__ = [
     # Message types
@@ -47,6 +52,8 @@ __all__ = [
     "AgentRole",
     "PlanningRequest",
     "PlanningResponse",
+    "TestingRequest",
+    "TestingResponse",
     "CommandMessage",
     "CommandResult",
     "StatusMessage",
@@ -60,14 +67,18 @@ __all__ = [
     "OrchestratorCommunicator",
     "PlannerCommunicator",
     "ExecutorCommunicator",
+    "TesterCommunicator",
     "create_orchestrator_communicator",
     "create_planner_communicator",
     "create_executor_communicator",
+    "create_tester_communicator",
     "create_agent_communicator",
     # Bridges
     "OrchestratorPlannerBridge",
     "OrchestratorExecutorBridge",
     "ExecutorMessageHandler",
+    "OrchestratorTesterBridge",
+    "TesterMessageHandler",
 ]
 
 __version__ = "1.0.0"

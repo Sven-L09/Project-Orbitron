@@ -305,6 +305,11 @@ class OrbitronKernel:
                 }
                 if timeout_s is not None:
                     chat_kwargs["timeout_s"] = timeout_s
+                else:
+                    # Use TimeoutManager for adaptive timeout
+                    chat_kwargs["timeout_s"] = self.timeout_manager.calculate_timeout(
+                        model_name=model_name,
+                    )
 
                 resp = self.ollama.chat(**chat_kwargs)
                 msg = resp.get("message") or {}
@@ -505,6 +510,35 @@ class OrbitronKernel:
                     },
                 },
             },
+            {
+                "type": "function",
+                "function": {
+                    "name": "web_search",
+                    "description": "Search the web for information. Returns a list of results with titles, URLs, and content snippets. Useful for looking up documentation, APIs, best practices, or current information.",
+                    "parameters": {
+                        "type": "object",
+                        "required": ["query"],
+                        "properties": {
+                            "query": {"type": "string", "description": "The search query string"},
+                            "max_results": {"type": "integer", "description": "Maximum number of results to return (1-10, default 5)", "default": 5},
+                        },
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "web_fetch",
+                    "description": "Fetch and read the content of a web page by URL. Returns the page title, content, and links. Useful for reading documentation, API references, or any web page.",
+                    "parameters": {
+                        "type": "object",
+                        "required": ["url"],
+                        "properties": {
+                            "url": {"type": "string", "description": "The URL of the web page to fetch"},
+                        },
+                    },
+                },
+            },
         ]
 
     def get_session(self, chat_id: int) -> list[dict[str, Any]]:
@@ -595,6 +629,10 @@ class OrbitronKernel:
                 return self._tool_git_status(tool_args)
             if tool_name == "git_diff":
                 return self._tool_git_diff(tool_args)
+            if tool_name == "web_search":
+                return self._tool_web_search(tool_args)
+            if tool_name == "web_fetch":
+                return self._tool_web_fetch(tool_args)
             return json.dumps({"ok": False, "error": f"Unknown tool: {tool_name}"})
         except Exception as e:
             return json.dumps({"ok": False, "error": str(e)})
@@ -732,6 +770,8 @@ class OrbitronKernel:
                 capture_output=True,
                 text=True,
                 timeout=timeout,
+                encoding="utf-8",
+                errors="replace",
             )
             return json.dumps({
                 "ok": result.returncode == 0,
@@ -830,6 +870,41 @@ class OrbitronKernel:
                 "ok": result.returncode == 0,
                 "diff": result.stdout,
                 "error": result.stderr if result.returncode != 0 else None,
+            })
+        except Exception as e:
+            return json.dumps({"ok": False, "error": str(e)})
+
+    def _tool_web_search(self, args: dict[str, Any]) -> str:
+        """Search the web using the Ollama Web Search API."""
+        query = args.get("query", "")
+        max_results = int(args.get("max_results", 5))
+        if not query:
+            return json.dumps({"ok": False, "error": "No search query provided"})
+        try:
+            results = self.ollama.web_search(query=query, max_results=max_results)
+            formatted = []
+            for r in results:
+                formatted.append({
+                    "title": r.get("title", ""),
+                    "url": r.get("url", ""),
+                    "content": r.get("content", ""),
+                })
+            return json.dumps({"ok": True, "query": query, "results": formatted})
+        except Exception as e:
+            return json.dumps({"ok": False, "error": str(e)})
+
+    def _tool_web_fetch(self, args: dict[str, Any]) -> str:
+        """Fetch a web page using the Ollama Web Fetch API."""
+        url = args.get("url", "")
+        if not url:
+            return json.dumps({"ok": False, "error": "No URL provided"})
+        try:
+            data = self.ollama.web_fetch(url=url)
+            return json.dumps({
+                "ok": True,
+                "title": data.get("title", ""),
+                "content": data.get("content", ""),
+                "links": data.get("links", []),
             })
         except Exception as e:
             return json.dumps({"ok": False, "error": str(e)})

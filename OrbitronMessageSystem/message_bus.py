@@ -274,7 +274,7 @@ class MessageBus:
         recipient: str,
         message: Message,
         wait_for_response: bool = False,
-        timeout_ms: int = 3600000,
+        timeout_ms: int = 300000,
     ) -> Optional[Message]:
         """Send a message to a specific recipient.
         
@@ -301,7 +301,7 @@ class MessageBus:
         recipient_role: AgentRole,
         message: Message,
         wait_for_response: bool = False,
-        timeout_ms: int = 3600000,
+        timeout_ms: int = 300000,
     ) -> Optional[Message]:
         """Send a message to all agents with a specific role.
         
@@ -327,7 +327,7 @@ class MessageBus:
         self,
         message: Message,
         wait_for_response: bool = False,
-        timeout_ms: int = 3600000,
+        timeout_ms: int = 300000,
     ) -> Optional[Message]:
         """Send a message to the Executor Agent.
         
@@ -377,7 +377,7 @@ class MessageBus:
     def wait_for_response(
         self,
         request_id: str,
-        timeout_ms: int = 3600000,
+        timeout_ms: int = 300000,
     ) -> Optional[Message]:
         """Wait for a response to a specific request.
         

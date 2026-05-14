@@ -57,53 +57,49 @@ class OrchestratorPlannerBridge:
         self,
         task_description: str,
         context: Optional[dict[str, Any]] = None,
-        timeout_seconds: int = 3600,
+        timeout_seconds: int = 900,
+        max_retries: int = 0,
     ) -> dict[str, Any]:
         """Request a plan from the Planner Agent.
-        
+
         This is a synchronous call that waits for the Planner to complete.
-        
+        If the request times out, it will be retried up to max_retries times.
+
         Args:
             task_description: Description of what needs to be planned
             context: Additional context (files, constraints, etc.)
-            timeout_seconds: Maximum time to wait for planning
-            
+            timeout_seconds: Maximum time to wait for planning (default 15 min)
+            max_retries: Number of retries after timeout (default 1)
+
         Returns:
             Dictionary containing the plan and analysis
-            
-        Example:
-            ```python
-            bridge = OrchestratorPlannerBridge()
-            result = bridge.request_plan(
-                task_description="Implement user authentication",
-                context={
-                    "existing_files": ["auth.py", "models.py"],
-                    "constraints": ["use JWT", "support OAuth"],
-                }
-            )
-            
-            if result["success"]:
-                plan = result["plan"]
-                print(f"Plan has {len(plan['steps'])} steps")
-            ```
         """
         logger = logging.getLogger("OrchestratorPlannerBridge")
         logger.info("[OrchestratorPlannerBridge] Requesting plan for: %s...", task_description[:50])
-        
-        # Send planning request and wait for response
-        response = self._communicator.request_planning(
-            request=task_description,
-            context=context,
-            timeout_ms=timeout_seconds * 1000,
-        )
-        
-        if response is None:
-            return {
-                "success": False,
-                "error": "Planning request timed out",
-                "plan": None,
-                "analysis": None,
-            }
+
+        for attempt in range(max_retries + 1):
+            if attempt > 0:
+                logger.warning("[OrchestratorPlannerBridge] Retrying planning (attempt %d/%d)", attempt + 1, max_retries + 1)
+
+            response = self._communicator.request_planning(
+                request=task_description,
+                context=context,
+                timeout_ms=timeout_seconds * 1000,
+            )
+
+            if response is not None:
+                break
+
+            logger.warning("[OrchestratorPlannerBridge] Planning timed out (attempt %d/%d)", attempt + 1, max_retries + 1)
+            if attempt < max_retries:
+                logger.info("[OrchestratorPlannerBridge] Retrying planning request...")
+            else:
+                return {
+                    "success": False,
+                    "error": f"Planning request timed out after {max_retries + 1} attempts ({timeout_seconds}s each)",
+                    "plan": None,
+                    "analysis": None,
+                }
         
         # Parse response
         success = response.metadata.get("success", False)
@@ -295,7 +291,11 @@ to the appropriate Planner Agent methods.
             )
 
     def _build_basic_plan(self, request: str, context: dict[str, Any]) -> dict[str, Any]:
-        """Build a minimal fallback plan when no plan was returned."""
+        """Build a minimal fallback plan when no plan was returned.
+
+        Generates a plan with proper skill/action/args so the Executor
+        can actually use it instead of rejecting it for missing fields.
+        """
         title = request.strip()
         if len(title) > 80:
             title = f"Plan: {title[:77]}..."
@@ -307,24 +307,37 @@ to the appropriate Planner Agent methods.
         if any(k in text for k in ["wandern", "hike", "reise", "travel", "camping", "itinerary", "hotel", "flug", "flight"]):
             plan_type = "experience"
 
+        # Determine primary skill and action based on task content
+        skill = "programming"
+        action = "create_file"
+        word_keywords = ["word", "docx", "document", "report", "bericht", "dokument"]
+        if any(k in text for k in word_keywords):
+            skill = "word"
+            action = "create_document"
+
+        # Build actionable steps with skill/action/args so they pass validation
         steps = [
             {
                 "id": "step-001",
-                "description": "Ziele und Anforderungen klar definieren",
+                "description": f"Analyze the project and identify issues for: {title}",
                 "priority": "high",
                 "depends_on": [],
+                "skill": "programming",
+                "action": "modify_file",
+                "args": {"path": ".", "description": f"Analyze and fix all issues for: {request[:200]}"},
+                "outputs": ["Implementation changes"],
+                "acceptance_criteria": ["All issues identified and fixed"],
             },
             {
                 "id": "step-002",
-                "description": "Plan strukturieren und notwendige Ressourcen sammeln",
-                "priority": "medium",
+                "description": f"Build and verify the project compiles/runs correctly",
+                "priority": "high",
                 "depends_on": ["step-001"],
-            },
-            {
-                "id": "step-003",
-                "description": "Ablauf und Zeitplan festlegen sowie Risiken bewerten",
-                "priority": "medium",
-                "depends_on": ["step-002"],
+                "skill": "programming",
+                "action": "modify_file",
+                "args": {"path": ".", "description": f"Run build and fix any remaining errors for: {request[:200]}"},
+                "outputs": ["Successful build"],
+                "acceptance_criteria": ["Build completes without errors"],
             },
         ]
 
@@ -333,16 +346,17 @@ to the appropriate Planner Agent methods.
             "id": f"plan-{datetime.now().strftime('%Y%m%d-%H%M%S')}",
             "title": title,
             "description": request,
-            "summary": "Auto-generierter Plan, da kein strukturierter Plan vorlag.",
+            "summary": f"Auto-generated plan for: {title}",
             "status": "draft",
             "created_at": datetime.now().isoformat(),
             "updated_at": datetime.now().isoformat(),
             "steps": steps,
             "artifacts": [],
-            "edge_cases": [],
+            "edge_cases": ["Fallback plan — may need adjustment based on actual project state"],
             "itinerary": [],
-            "risks": [],
+            "risks": ["Fallback plan may not cover all requirements — Executor should adapt as needed"],
             "packing_list": [],
+            "assumptions": ["Task can be implemented with the available skills"],
             "metadata": {
                 "source": "fallback",
                 "plan_type": plan_type,

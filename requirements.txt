@@ -1,0 +1,2 @@
+pypandoc>=1.14
+playwright>=1.40.0

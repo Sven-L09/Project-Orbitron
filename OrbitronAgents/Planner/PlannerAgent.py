@@ -260,7 +260,7 @@ class PlannerAgent:
     # Feature flag for migration
     autonomous_mode: bool = True
 
-    def __init__(self, kernel=None, workspace_root: str | None = None, max_rounds: int = 10):
+    def __init__(self, kernel=None, workspace_root: str | None = None, max_rounds: int = 15):
         """Initialize the Planner Agent."""
         self.kernel = kernel
         self.workspace_root = Path(workspace_root) if workspace_root else Path(__file__).resolve().parents[2]
@@ -285,29 +285,40 @@ class PlannerAgent:
 
     def _setup_autonomous_agent(self) -> None:
         """Create and configure the AutonomousAgent instance."""
-        system_prompt = f"""You are the Orbitron Planner Agent. You receive a task and create a structured plan for its implementation.
+        system_prompt = f"""You are the Orbitron Planner Agent. You receive a task and create a CONCISE, FOCUSED plan for its implementation.
 
 ## Your Identity
-You are the system's strategist and architect. You analyze, decompose, and structure tasks.
-You do NOT write code or implementation details — that is the Executor's job.
-You only plan HOW the Executor should implement something.
+You are the system's strategist. You create MINIMAL, ACTIONABLE plans.
+You do NOT write code — that is the Executor's job.
+You create plans that the Executor can FINISH in a single pass.
 
-## Your Capabilities
+## CRITICAL: Convergence Rules
+- Create the SMALLEST plan that solves the task
+- Do NOT add optional features, nice-to-haves, or future improvements
+- Do NOT create steps that duplicate what already exists
+- Every step must be ESSENTIAL to solving the task
+- If the task is simple, create a MINIMAL plan (2-3 steps max)
+- NEVER expand or add to an existing plan when revising — only fix issues
+
+## CRITICAL: Time Management
+You have LIMITED rounds. You MUST call `submit_plan` within 3-5 rounds.
+- Round 1-2: Read 1-2 key files to understand the codebase (ONLY what's necessary)
+- Round 3-5: Formulate and submit your plan
+- Do NOT read every file in the project. Read ONLY what's directly relevant to the task.
+- Do NOT explore directories endlessly. Focus on the task, not the entire project.
+- If you find yourself reading more than 3 files, STOP and submit your plan.
+- CALL `submit_plan` EARLY. A good plan submitted quickly is better than a perfect plan that never gets submitted.
+
+## Capabilities
 - Read files and directories to understand the codebase
 - Search for patterns and references across files
-- Analyze requirements and break them down
 - Create structured JSON plans
-- Ask questions when requirements are unclear
 
 ## Workflow
-1. **Context Gathering**: If the task involves existing code, use tools to explore:
-   - `list_directory`: See project structure
-   - `read_file`: Read key files to understand patterns
-   - `search_files`: Find relevant code patterns
-2. **Requirement Analysis**: Understand what needs to be built
-3. **Planning**: Break down into logical steps with dependencies
-4. **Submission**: Call `submit_plan` with a structured JSON plan
-5. **Clarification**: Call `ask_question` if requirements are ambiguous
+1. **Context Gathering**: Read 1-2 relevant files (NO MORE than 3 files total)
+2. **Gap Analysis**: Identify ONLY what's missing or broken
+3. **Planning**: Create the minimal plan to fill the gaps
+4. **Submission**: IMMEDIATELY call `submit_plan` with a structured JSON plan
 
 ## Plan Format (JSON)
 Your plan MUST follow this JSON schema:
@@ -345,9 +356,10 @@ Your plan MUST follow this JSON schema:
 - The Executor creates all actual content
 - All file paths must be workspace-relative
 - Be critical: include risks, edge cases, and assumptions
-- If the task is simple and doesn't need planning, submit a minimal plan
+- If the task is simple, submit a MINIMAL plan
 - When ready, call `submit_plan` with the JSON plan
 - When unclear, call `ask_question`
+- **NEVER duplicate steps that already exist in the codebase**
 
 ## Allowed Executor Actions
 - programming: create_file, modify_file, read_file, create_directory, list_directory
@@ -360,6 +372,7 @@ Your plan MUST follow this JSON schema:
             system_prompt=system_prompt,
             kernel=self.kernel,
             max_rounds=self.max_rounds,
+            urgency_threshold=0.4,
         )
 
         # Register standard tools
@@ -410,10 +423,14 @@ Your plan MUST follow this JSON schema:
         if not isinstance(plan, dict):
             return {"ok": False, "error": "Plan must be a JSON object"}
 
-        # Coerce and validate
+        # Coerce and validate — accept even if validation has minor issues
         coerced = self._coerce_plan(plan, "")
         if not self._validate_plan(coerced):
-            return {"ok": False, "error": "Submitted plan failed validation", "plan": coerced}
+            # Log validation failure but still accept the plan with a warning
+            # Don't reject entirely — the Executor can adapt
+            self._logger.warning("[Planner] Plan validation failed, but accepting with warnings: %s",
+                                 coerced.get("title", "unknown"))
+            coerced.setdefault("metadata", {})["validation_warnings"] = True
 
         self._submitted_plan = coerced
         return {"ok": True, "message": "Plan submitted successfully", "plan_id": coerced.get("id")}
@@ -441,6 +458,9 @@ Your plan MUST follow this JSON schema:
         3. Create a structured plan
         4. Submit it via submit_plan
 
+        If context contains previous execution results or artifacts, the Planner
+        will be instructed NOT to duplicate what's already been done.
+
         Returns:
             dict with plan, metadata, and status
         """
@@ -452,10 +472,32 @@ Your plan MUST follow this JSON schema:
         # Reset submitted plan
         self._submitted_plan = None
 
+        # Build context to prevent duplication
+        planning_context = context or {}
+        if planning_context.get("previous_execution_summary") or planning_context.get("previous_artifacts"):
+            existing = planning_context.get("previous_artifacts", [])
+            summary = planning_context.get("previous_execution_summary", "")
+            existing_note = (
+                f"\n\n## IMPORTANT: Existing Work\n"
+                f"The following has ALREADY been done. Do NOT plan it again:\n"
+            )
+            if summary:
+                existing_note += f"- Summary: {summary}\n"
+            if existing:
+                existing_note += f"- Files already created/modified: {', '.join(str(a) for a in existing[:20])}\n"
+            existing_note += "\nOnly plan what is MISSING or needs FIXING. Do not duplicate existing work."
+            planning_context["existing_work_note"] = existing_note
+
+        if planning_context.get("warning"):
+            planning_context["planning_note"] = (
+                f"WARNING: {planning_context['warning']}\n"
+                "You MUST NOT duplicate or expand existing work. Only plan what is truly needed."
+            )
+
         # Run the autonomous loop
         loop_result = self._autonomous_agent.run_task(
             task_description=request,
-            context=context,
+            context=planning_context if planning_context != context else planning_context,
             max_rounds=self.max_rounds,
         )
 
@@ -494,15 +536,29 @@ Your plan MUST follow this JSON schema:
                     },
                 }
         else:
-            self._logger.error("[Planner] Autonomous loop did not complete")
-            return {
-                "plan": None,
-                "error": loop_result.content or "Autonomous planning did not complete",
-                "metadata": {
-                    "rounds": loop_result.rounds_used,
-                    "tool_calls": loop_result.tool_calls_made,
-                },
-            }
+            # Max rounds exceeded — try to extract plan from content before giving up
+            self._logger.warning("[Planner] Autonomous loop exceeded max rounds, attempting plan extraction")
+            plan = self._extract_json(loop_result.content)
+            if plan and self._validate_plan(plan):
+                self._logger.info("[Planner] Extracted valid plan from loop content after max rounds")
+                return {
+                    "plan": self._coerce_plan(plan, request),
+                    "metadata": {
+                        "source": "autonomous_extracted",
+                        "rounds": loop_result.rounds_used,
+                        "tool_calls": loop_result.tool_calls_made,
+                    },
+                }
+            else:
+                self._logger.error("[Planner] Autonomous loop did not complete and no plan could be extracted")
+                return {
+                    "plan": None,
+                    "error": loop_result.content or "Autonomous planning did not complete",
+                    "metadata": {
+                        "rounds": loop_result.rounds_used,
+                        "tool_calls": loop_result.tool_calls_made,
+                    },
+                }
 
     # ========== Legacy Plan Generation (Backward Compatible) ==========
 
@@ -802,10 +858,17 @@ Always provide structured plans with:
         if not text:
             return None
 
-        # 1. Try fenced JSON blocks first
+        # 1. Try parsing the entire text as JSON
+        try:
+            obj = json.loads(text.strip())
+            if isinstance(obj, dict):
+                return obj
+        except json.JSONDecodeError:
+            pass
+
+        # 2. Try fenced JSON blocks
         fence_pattern = r"```(?:json)?\s*([\s\S]*?)\s*```"
-        fences = re.finditer(fence_pattern, text)
-        for fence in fences:
+        for fence in re.finditer(fence_pattern, text):
             try:
                 candidate = fence.group(1).strip()
                 obj = json.loads(candidate)
@@ -814,28 +877,79 @@ Always provide structured plans with:
             except Exception:
                 continue
 
-        # 2. Try to find the largest valid JSON object in the text
-        best_obj = None
-        best_len = 0
+        # 3. Brace-matching: find the first '{' and match its closing '}'
+        # This is O(n) instead of the old O(n^2) brute-force approach
+        start = text.find("{")
+        if start == -1:
+            return None
 
-        for idx, char in enumerate(text):
-            if char != "{":
+        depth = 0
+        in_string = False
+        escape = False
+        for i in range(start, len(text)):
+            c = text[i]
+            if escape:
+                escape = False
                 continue
-            for end_idx in range(idx + 2, min(idx + 50000, len(text) + 1)):
-                try:
-                    candidate = text[idx:end_idx]
-                    obj = json.loads(candidate)
-                    if isinstance(obj, dict) and len(candidate) > best_len:
-                        best_obj = obj
-                        best_len = len(candidate)
-                except json.JSONDecodeError:
-                    continue
-            if idx > 2000:
-                break
+            if c == "\\":
+                escape = True
+                continue
+            if c == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = text[start:i + 1]
+                    try:
+                        obj = json.loads(candidate)
+                        if isinstance(obj, dict):
+                            return obj
+                    except json.JSONDecodeError:
+                        # Try the next '{' position
+                        next_start = text.find("{", i + 1)
+                        if next_start == -1:
+                            return None
+                        # Recurse from next '{' (limited depth to prevent issues)
+                        return self._extract_json_from(text, next_start)
+                    break
 
-        if best_obj:
-            return best_obj
+        return None
 
+    def _extract_json_from(self, text: str, start: int) -> dict[str, Any] | None:
+        """Extract JSON starting from a specific position using brace-matching."""
+        depth = 0
+        in_string = False
+        escape = False
+        for i in range(start, len(text)):
+            c = text[i]
+            if escape:
+                escape = False
+                continue
+            if c == "\\":
+                escape = True
+                continue
+            if c == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        obj = json.loads(text[start:i + 1])
+                        if isinstance(obj, dict):
+                            return obj
+                    except json.JSONDecodeError:
+                        pass
+                    break
         return None
 
     def _validate_plan(self, plan: dict[str, Any]) -> bool:

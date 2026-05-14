@@ -159,10 +159,12 @@ class ServiceSystem:
         self.orchestrator = None
         self.planner = None
         self.executor = None
+        self.tester = None
         self.kernel = None
         self.telegram_bot = None
         self.planner_message_handler = None
         self.executor_message_handler = None
+        self.tester_message_handler = None
         self._telegram_thread: Optional[threading.Thread] = None
         
         self._running = False
@@ -283,9 +285,26 @@ class ServiceSystem:
             self.executor_message_handler = ExecutorMessageHandler(self.executor, agent_name="executor")
             lifetime.log("Executor", "message_handler_registered")
             logger.info("[OK] Executor Agent ready")
+
+            # 4b. Start Tester Agent
+            logger.info("[4b/6] Starting Tester Agent...")
+            lifetime.log("Tester", "startup_initiated")
+            from OrbitronAgents.Tester import create_tester_agent
+            from OrbitronMessageSystem.orchestrator_tester_bridge import TesterMessageHandler
+
+            self.tester = create_tester_agent(
+                agent_name="tester",
+                workspace_root=str(self.workspace_root),
+                kernel=self.kernel,
+            )
+
+            # Register tester handler on message bus
+            self.tester_message_handler = TesterMessageHandler(self.tester, agent_name="tester")
+            lifetime.log("Tester", "message_handler_registered")
+            logger.info("[OK] Tester Agent ready")
             
             # 5. Start Orchestrator
-            logger.info("[5/5] Starting Orchestrator...")
+            logger.info("[5/6] Starting Orchestrator...")
             lifetime.log("Orchestrator", "startup_initiated")
             from OrbitronAgents.Orchestrator import create_orchestrator
             
@@ -293,8 +312,8 @@ class ServiceSystem:
                 kernel=self.kernel,
                 workspace_root=str(self.workspace_root),
                 max_planning_iterations=self.max_planning_iterations,
-                planning_timeout_seconds=3600,  # 1 hour for complex code generation
-                execution_timeout_seconds=3600,  # 1 hour for execution (multiple LLM calls)
+                planning_timeout_seconds=900,  # 15 min timeout, then retry
+                execution_timeout_seconds=900,  # 15 min timeout, then retry
             )
             self.orchestrator.connect_to_message_bus()
             
@@ -305,7 +324,7 @@ class ServiceSystem:
             
             # 6. Start Telegram Bot (if enabled)
             if self.enable_telegram:
-                logger.info("[5/5] Starting Telegram Bot...")
+                logger.info("[6/6] Starting Telegram Bot...")
                 lifetime.log("TelegramBot", "startup_initiated")
                 try:
                     from TelegramBot.bot_service import TelegramBotService, service_from_env
@@ -341,6 +360,8 @@ class ServiceSystem:
                     "message_bus": self.message_bus is not None,
                     "kernel": self.kernel is not None,
                     "planner": self.planner is not None,
+                    "executor": self.executor is not None,
+                    "tester": self.tester is not None,
                     "orchestrator": self.orchestrator is not None,
                     "telegram_bot": self.telegram_bot is not None,
                 }
@@ -353,6 +374,7 @@ class ServiceSystem:
             print(f"  Kernel:        {'[OK]' if self.kernel else '[FAIL]'}")
             print(f"  Planner:       {'[OK]' if self.planner else '[FAIL]'}")
             print(f"  Executor:      {'[OK]' if self.executor else '[FAIL]'}")
+            print(f"  Tester:        {'[OK]' if self.tester else '[FAIL]'}")
             print(f"  Orchestrator:  {'[OK]' if self.orchestrator else '[FAIL]'}")
             print(f"  TelegramBot:   {'[OK]' if self.telegram_bot else '[FAIL]'}")
             print("=" * 70)
@@ -417,6 +439,17 @@ class ServiceSystem:
             except Exception as e:
                 logger.error(f"[FAIL] Error stopping executor handler: {e}")
                 lifetime.log("Executor", "message_handler_error", {"error": str(e)})
+
+        # Stop Tester message handler
+        if self.tester_message_handler:
+            logger.info("Stopping Tester message handler...")
+            try:
+                self.tester_message_handler.close()
+                lifetime.log("Tester", "message_handler_stopped")
+                logger.info("[OK] Tester message handler stopped")
+            except Exception as e:
+                logger.error(f"[FAIL] Error stopping tester handler: {e}")
+                lifetime.log("Tester", "message_handler_error", {"error": str(e)})
 
         # Stop Planner message handler
         if self.planner_message_handler:
@@ -495,9 +528,9 @@ class ServiceSystem:
         task = self.orchestrator.create_task(description, context)
         lifetime.log("Orchestrator", "task_created", {"task_id": task.task_id})
         
-        # Send progress update
+        # Send progress update (only to logs, no more robotic Telegram messages)
         if progress_callback:
-            progress_callback("Task erstellt. Starte Planung...")
+            progress_callback("")
         
         logger.info("[ServiceSystem] [TaskFlow] Step 2: Orchestrator.run_task(%s)", task.task_id)
         logger.info("[ServiceSystem] [TaskFlow]   -> Entering planning loop...")
@@ -505,13 +538,8 @@ class ServiceSystem:
         # Run task with progress updates
         result = self.orchestrator.run_task(task.task_id)
         
-        # Send progress update after planning
-        if progress_callback and result.get("success"):
-            iterations = result.get("iterations", 1)
-            if iterations and iterations > 1:
-                progress_callback(f"Plan nach {iterations} Iterationen finalisiert. Starte Ausführung...")
-            else:
-                progress_callback("Plan in erster Iteration finalisiert. Starte Ausführung...")
+        # No intermediate progress messages to Telegram — the initial
+        # acknowledgment and the final result reply are enough.
         
         # Log result
         if result.get("success"):
@@ -570,53 +598,162 @@ class ServiceSystem:
             "username": username,
         }
 
-        # Progress callback for live updates
+        # Progress callback — only sends non-empty messages
         def _progress_update(msg: str) -> None:
-            if callable(send):
-                # Generate a personal response for each progress update
-                orchestrator_reply = self._generate_orchestrator_reply(
-                    f"User '{username}' asked: '{text[:100]}...' — "
-                    f"Progress update: {msg}. Respond briefly and personally."
-                )
-                send(orchestrator_reply)
+            if callable(send) and msg:
+                send(msg)
 
-        # Initial acknowledgment
+        # Initial acknowledgment — natural, personality-driven
         if callable(send):
-            orchestrator_reply = self._generate_orchestrator_reply(
-                f"User '{username}' asked: '{text[:100]}...' — Acknowledge briefly and say you're working on it."
-            )
+            orchestrator_reply = self._generate_orchestrator_reply(text, username=username)
             send(orchestrator_reply)
 
         result = self.process_task(text, context, progress_callback=_progress_update)
 
         if result.get("success"):
-            return self._format_plan_for_telegram(result)
+            return self._generate_result_reply(result, user_text=text)
 
-        return f"Fehler beim Planen: {result.get('error', 'Unbekannter Fehler')}"
+        # Error case — also generate a natural message
+        error = result.get("error") or "Unbekannter Fehler"
+        return self._generate_error_reply(error, user_text=text)
 
-    def _generate_orchestrator_reply(self, prompt: str) -> str:
-        """Generate a living, personal response from the Orchestrator.
-        
-        The Orchestrator has IDENTITY, SOUL, and USER context — 
-        it should respond like a real person, not a robot.
-        """
+    def _generate_error_reply(self, error: str, user_text: str) -> str:
+        """Generate a natural error message from the Orchestrator."""
         if not self.orchestrator or not self.orchestrator.kernel:
-            return "Ich arbeite daran..."
-        
+            return f"Das hat leider nicht geklappt: {error}"
+
         try:
-            system_prompt = self.orchestrator.get_system_prompt()
+            prompt = (
+                f"Beim Auftrag '{user_text[:200]}' ist ein Fehler aufgetreten:\n"
+                f"{error[:300]}\n\n"
+                f"Erkläre Sven kurz, was schiefgelaufen ist — natürlich und ehrlich. "
+                f"Keine Floskeln, maximal 3 Sätze."
+            )
             response = self.orchestrator.kernel.ollama.chat(
                 messages=[
-                    {"role": "system", "content": system_prompt},
+                    {"role": "system", "content": "Du bist Orbitron. Erkläre Fehler kurz und ehrlich auf Deutsch."},
+                    {"role": "user", "content": prompt},
+                ],
+                stream=False,
+                timeout_s=20,
+                max_retries=0,
+            )
+            content = str((response.get("message") or {}).get("content") or "")
+            return content.strip() or f"Das hat leider nicht geklappt: {error}"
+        except Exception:
+            return f"Das hat leider nicht geklappt: {error}"
+
+    def _generate_orchestrator_reply(self, user_text: str, username: str = "Sven") -> str:
+        """Generate a natural acknowledgment from the Orchestrator.
+
+        Uses a minimal prompt — no full IDENTITY/SOUL/USER context needed
+        for a 2-sentence acknowledgment. Short timeout, no retries.
+        """
+        if not self.orchestrator or not self.orchestrator.kernel:
+            return "Ich schau mir das an."
+
+        try:
+            prompt = (
+                f"{username} schreibt: '{user_text[:300]}'\n\n"
+                f"Antworte als Orbitron — kurz, natürlich, menschlich. "
+                f"Keine Floskeln, kein Echo. Zeig dass du verstanden hast "
+                f"und dich dransetzt. Maximal 2 Sätze."
+            )
+            response = self.orchestrator.kernel.ollama.chat(
+                messages=[
+                    {"role": "system", "content": "Du bist Orbitron, ein digitaler Partner. Antworte kurz und natürlich auf Deutsch."},
+                    {"role": "user", "content": prompt},
+                ],
+                stream=False,
+                timeout_s=20,
+                max_retries=0,
+            )
+            content = str((response.get("message") or {}).get("content") or "")
+            return content.strip() or "Ich schau mir das an."
+        except Exception:
+            return "Ich schau mir das an."
+
+    def _generate_result_reply(self, result: dict[str, Any], user_text: str) -> str:
+        """Generate a natural result summary from the Orchestrator.
+
+        Uses a minimal prompt instead of the full system context.
+        Falls back to template formatting if the LLM is unavailable.
+        """
+        if not self.orchestrator or not self.orchestrator.kernel:
+            return self._format_plan_for_telegram(result)
+
+        try:
+            result_summary = self._build_result_summary(result)
+
+            prompt = (
+                f"Auftrag: '{user_text[:200]}'\n"
+                f"Ergebnis:\n{result_summary}\n\n"
+                f"Fasse zusammen was erledigt wurde — natürlich und menschlich. "
+                f"Keine internen Details. Maximal 4 Sätze."
+            )
+            response = self.orchestrator.kernel.ollama.chat(
+                messages=[
+                    {"role": "system", "content": "Du bist Orbitron. Gib Sven ein kurzes, natürliches Update auf Deutsch."},
                     {"role": "user", "content": prompt},
                 ],
                 stream=False,
                 timeout_s=30,
+                max_retries=0,
             )
             content = str((response.get("message") or {}).get("content") or "")
-            return content.strip() or "Ich arbeite daran..."
+            return content.strip() or self._format_plan_for_telegram(result)
         except Exception:
-            return "Ich arbeite daran..."
+            return self._format_plan_for_telegram(result)
+
+    def _build_result_summary(self, result: dict[str, Any]) -> str:
+        """Build a compact text summary of the result dict for the LLM."""
+        parts = []
+
+        success = result.get("success", False)
+        parts.append(f"Erfolgreich: {'ja' if success else 'nein'}")
+
+        # Autonomous loop result
+        if result.get("autonomous"):
+            summary = result.get("summary") or result.get("answer", "")
+            if summary:
+                parts.append(f"Zusammenfassung: {summary[:500]}")
+            artifacts = result.get("artifacts") or []
+            if artifacts:
+                parts.append(f"Artefakte: {', '.join(str(a) for a in artifacts[:10])}")
+            return "\n".join(parts)
+
+        # Plan-based result
+        plan = result.get("plan") or {}
+        if plan:
+            plan_type = plan.get("plan_type", "")
+            if plan_type:
+                parts.append(f"Typ: {plan_type}")
+            summary = plan.get("summary") or plan.get("description") or ""
+            if summary:
+                parts.append(f"Beschreibung: {summary[:300]}")
+            steps = plan.get("steps") or []
+            if steps:
+                step_descs = [s.get("description", "")[:80] for s in steps[:5] if s.get("description")]
+                if step_descs:
+                    parts.append(f"Schritte: {'; '.join(step_descs)}")
+
+        # Execution result
+        execution = result.get("execution") or {}
+        if execution:
+            exec_result = execution.get("execution_result") or {}
+            if isinstance(exec_result, dict):
+                artifacts = exec_result.get("artifacts") or []
+                if artifacts:
+                    parts.append(f"Erstellte Dateien: {', '.join(str(a) for a in artifacts[:10])}")
+
+        # Validation
+        validation = result.get("validation") or {}
+        if validation:
+            passed = validation.get("passed", False)
+            quality = validation.get("quality_rating", "")
+            parts.append(f"Validierung: {'bestanden' if passed else 'nicht bestanden'}" + (f" ({quality})" if quality else ""))
+
+        return "\n".join(parts)
 
     def _format_plan_for_telegram(self, result: dict[str, Any]) -> str:
         """Format a plan response for Telegram without raw planning steps."""
@@ -751,6 +888,9 @@ class ServiceSystem:
                 "initialized": True,
                 "plans_count": len(self.planner.skill._plans) if hasattr(self.planner.skill, '_plans') else 0,
             }
+
+        if self.tester:
+            status["components"]["tester"] = self.tester.get_status()
         
         return status
     

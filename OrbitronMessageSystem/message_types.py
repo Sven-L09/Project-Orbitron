@@ -29,6 +29,10 @@ class MessageType(Enum):
     PLANNING_REQUEST = auto()   # Request for planning
     PLANNING_RESPONSE = auto()  # Planning result
     PLAN_UPDATE = auto()       # Update to an existing plan
+
+    # Testing specific
+    TESTING_REQUEST = auto()   # Request for quality testing
+    TESTING_RESPONSE = auto()  # Testing result
     
     # Status and monitoring
     STATUS = auto()       # Status update
@@ -52,6 +56,7 @@ class AgentRole(Enum):
     ORCHESTRATOR = "orchestrator"
     PLANNER = "planner"
     EXECUTOR = "executor"
+    TESTER = "tester"
     CODER = "coder"
     REVIEWER = "reviewer"
     KERNEL = "kernel"
@@ -173,7 +178,7 @@ class PlanningRequest(Message):
         context: Optional[dict[str, Any]] = None,
         sender: str = "orchestrator",
         priority: MessagePriority = MessagePriority.NORMAL,
-        timeout_ms: int = 3600000,
+        timeout_ms: int = 300000,
     ) -> Message:
         """Create a planning request message."""
         header = MessageHeader(
@@ -355,4 +360,83 @@ class CommandResult(Message):
             metadata={
                 "error": error_message,
             },
+        )
+
+
+@dataclass
+class TestingRequest(Message):
+    """Message for requesting quality testing from the Tester Agent."""
+
+    @staticmethod
+    def create(
+        task_description: str,
+        artifacts: list[str],
+        requirements: Optional[dict[str, Any]] = None,
+        execution_result: Optional[dict[str, Any]] = None,
+        sender: str = "orchestrator",
+        priority: MessagePriority = MessagePriority.NORMAL,
+        timeout_ms: int = 300000,
+    ) -> Message:
+        """Create a testing request message."""
+        header = MessageHeader(
+            message_type=MessageType.TESTING_REQUEST,
+            sender=sender,
+            sender_role=AgentRole.ORCHESTRATOR,
+            recipient_role=AgentRole.TESTER,
+            priority=priority,
+            timeout_ms=timeout_ms,
+        )
+
+        return Message(
+            header=header,
+            payload={
+                "task_description": task_description,
+                "artifacts": artifacts,
+                "requirements": requirements or {},
+                "execution_result": execution_result or {},
+            },
+            metadata={
+                "request_type": "testing",
+                "requires_response": True,
+            },
+        )
+
+
+@dataclass
+class TestingResponse(Message):
+    """Message containing testing results from the Tester Agent."""
+
+    @staticmethod
+    def create(
+        request_id: str,
+        quality_rating: str,
+        issues: list[dict[str, Any]],
+        summary: str,
+        passed: bool = True,
+        sender: str = "tester",
+        success: bool = True,
+        error_message: Optional[str] = None,
+    ) -> Message:
+        """Create a testing response message."""
+        header = MessageHeader(
+            message_type=MessageType.TESTING_RESPONSE,
+            sender=sender,
+            sender_role=AgentRole.TESTER,
+            recipient_role=AgentRole.ORCHESTRATOR,
+            correlation_id=request_id,
+        )
+
+        metadata = {"success": success}
+        if error_message:
+            metadata["error"] = error_message
+
+        return Message(
+            header=header,
+            payload={
+                "quality_rating": quality_rating,
+                "issues": issues,
+                "summary": summary,
+                "passed": passed,
+            },
+            metadata=metadata,
         )

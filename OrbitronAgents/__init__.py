@@ -4,6 +4,7 @@ This package contains specialized agents for the Orbitron system:
 - Orchestrator: Central coordinator and task manager
 - Planner: Strategic planning and task decomposition
 - Executor: Plan execution and implementation
+- Tester: Critical quality assurance and testing
 - Base: Abstract base classes and utilities
 """
 
@@ -28,6 +29,11 @@ from .Executor import (
     ExecutorAgent,
     create_executor_agent,
     ExecutionState,
+)
+
+from .Tester import (
+    TesterAgent,
+    create_tester_agent,
 )
 
 from .base import (
@@ -61,6 +67,9 @@ __all__ = [
     "ExecutorAgent",
     "create_executor_agent",
     "ExecutionState",
+    # Tester
+    "TesterAgent",
+    "create_tester_agent",
     # Base
     "AgentBase",
     "AgentState",

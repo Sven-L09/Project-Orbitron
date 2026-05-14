@@ -8,27 +8,23 @@ import logging
 import os
 import subprocess
 import tempfile
-from pathlib import Path
 from typing import Any
+
+from .skill_base import ExecutorSkill
 
 logger = logging.getLogger("Executor.OpenCodeSkill")
 
 
-from .skill_base import ExecutorSkill
-
 class OpenCodeSkill(ExecutorSkill):
-    """Skill for executing open code and system commands.
-
-    Note: This class does NOT inherit from ExecutorSkill to avoid
-    circular dependencies. It's used directly by ExecutorAgent.
-    """
+    """Skill for executing open code and system commands."""
 
     def __init__(self, workspace: str | None = None):
-        self.name = "opencode"
-        self.description = "Execute code snippets and system commands"
-        self.workspace = workspace
-        self._tools: list[dict[str, Any]] = []
-        self._handlers: dict[str, Any] = {}
+        super().__init__(
+            name="opencode",
+            description="Execute code snippets and system commands",
+        )
+        if workspace:
+            self.set_workspace(workspace)
         self._setup_tools()
 
     def _setup_tools(self) -> None:
@@ -79,29 +75,6 @@ class OpenCodeSkill(ExecutorSkill):
             },
             self._handle_execute_command
         )
-
-    def register_tool(self, name: str, schema: dict[str, Any], handler: Any) -> None:
-        """Register a tool with its schema and handler."""
-        self._tools.append({
-            "type": "function",
-            "function": {
-                "name": name,
-                **schema
-            }
-        })
-        self._handlers[name] = handler
-
-    def get_tools(self) -> list[dict[str, Any]]:
-        """Get all tool schemas for this skill."""
-        return self._tools
-
-    def get_handlers(self) -> dict[str, Any]:
-        """Get all tool handlers for this skill."""
-        return self._handlers
-
-    def set_workspace(self, workspace: str) -> None:
-        """Set the workspace directory for file operations."""
-        self.workspace = workspace
 
     def _handle_execute_python(self, args: dict[str, Any]) -> str:
         """Handle execute_python tool call."""

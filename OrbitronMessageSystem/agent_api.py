@@ -18,6 +18,8 @@ from .message_types import (
     CommandMessage,
     StatusMessage,
     ErrorMessage,
+    TestingRequest,
+    TestingResponse,
 )
 from .message_bus import MessageBus, get_message_bus
 
@@ -85,7 +87,7 @@ class AgentCommunicator:
         request: str,
         context: Optional[dict[str, Any]] = None,
         priority: MessagePriority = MessagePriority.NORMAL,
-        timeout_ms: int = 3600000,
+        timeout_ms: int = 300000,
     ) -> Optional[Message]:
         """Request planning from the Planner Agent.
         
@@ -155,7 +157,7 @@ class AgentCommunicator:
         args: Optional[dict[str, Any]] = None,
         recipient_role: AgentRole = AgentRole.KERNEL,
         wait_for_response: bool = True,
-        timeout_ms: int = 3600000,
+        timeout_ms: int = 300000,
     ) -> Optional[Message]:
         """Send a command to execute.
         
@@ -189,7 +191,7 @@ class AgentCommunicator:
         command: str,
         args: Optional[dict[str, Any]] = None,
         wait_for_response: bool = True,
-        timeout_ms: int = 3600000,
+        timeout_ms: int = 300000,
     ) -> Optional[Message]:
         """Send a command to a specific agent.
         
@@ -330,7 +332,7 @@ class OrchestratorCommunicator(AgentCommunicator):
         request: str,
         context: Optional[dict[str, Any]] = None,
         priority: MessagePriority = MessagePriority.NORMAL,
-        timeout_ms: int = 3600000,
+        timeout_ms: int = 300000,
     ) -> Optional[Message]:
         """Request planning from the Planner Agent."""
         # Add orchestrator context
@@ -368,10 +370,10 @@ class PlannerCommunicator(AgentCommunicator):
 
 class ExecutorCommunicator(AgentCommunicator):
     """Specialized communicator for the Executor Agent."""
-    
+
     def __init__(self, agent_name: str = "executor", message_bus: Optional[MessageBus] = None):
         super().__init__(agent_name, AgentRole.EXECUTOR, message_bus)
-    
+
     def send_execution_result(
         self,
         request_id: str,
@@ -380,7 +382,7 @@ class ExecutorCommunicator(AgentCommunicator):
         error_message: Optional[str] = None,
     ) -> None:
         """Send execution results back to the requester (usually Orchestrator).
-        
+
         Args:
             request_id: ID of the execution request
             execution_result: Results of the execution
@@ -404,22 +406,22 @@ class ExecutorCommunicator(AgentCommunicator):
             },
         )
         self._bus.publish(message)
-    
+
     def request_execution(
         self,
         plan: dict[str, Any],
         context: Optional[dict[str, Any]] = None,
         priority: MessagePriority = MessagePriority.NORMAL,
-        timeout_ms: int = 3600000,
+        timeout_ms: int = 300000,
     ) -> Optional[Message]:
         """Request execution of a plan.
-        
+
         Args:
             plan: The plan to execute
             context: Additional execution context
             priority: Priority of execution
             timeout_ms: Timeout for execution
-            
+
         Returns:
             Execution result message or None if timeout
         """
@@ -433,9 +435,88 @@ class ExecutorCommunicator(AgentCommunicator):
             recipient_role=AgentRole.EXECUTOR,
             priority=priority,
         )
-        
+
         return self._bus.send_to_role(
             recipient_role=AgentRole.EXECUTOR,
+            message=message,
+            wait_for_response=True,
+            timeout_ms=timeout_ms,
+        )
+
+
+class TesterCommunicator(AgentCommunicator):
+    """Specialized communicator for the Tester Agent."""
+
+    def __init__(self, agent_name: str = "tester", message_bus: Optional[MessageBus] = None):
+        super().__init__(agent_name, AgentRole.TESTER, message_bus)
+
+    def send_testing_result(
+        self,
+        request_id: str,
+        quality_rating: str,
+        issues: list[dict[str, Any]],
+        summary: str,
+        passed: bool = True,
+        success: bool = True,
+        error_message: Optional[str] = None,
+    ) -> None:
+        """Send testing results back to the Orchestrator.
+
+        Args:
+            request_id: ID of the testing request
+            quality_rating: Overall quality rating (excellent/good/poor)
+            issues: List of issues found during testing
+            summary: Summary of the testing result
+            passed: Whether the product passed quality checks
+            success: Whether the testing process itself succeeded
+            error_message: Optional error message
+        """
+        message = TestingResponse.create(
+            request_id=request_id,
+            quality_rating=quality_rating,
+            issues=issues,
+            summary=summary,
+            passed=passed,
+            sender=self.agent_name,
+            success=success,
+            error_message=error_message,
+        )
+        self._bus.publish(message)
+
+    def request_testing(
+        self,
+        task_description: str,
+        artifacts: list[str],
+        requirements: Optional[dict[str, Any]] = None,
+        execution_result: Optional[dict[str, Any]] = None,
+        priority: MessagePriority = MessagePriority.NORMAL,
+        timeout_ms: int = 300000,
+    ) -> Optional[Message]:
+        """Request quality testing from the Tester Agent.
+
+        Args:
+            task_description: Description of the original task
+            artifacts: List of artifact file paths to test
+            requirements: Original requirements for validation
+            execution_result: Result from the Executor
+            priority: Priority of the testing request
+            timeout_ms: Timeout for testing
+
+        Returns:
+            TestingResponse message or None if timeout
+        """
+        message = TestingRequest.create(
+            task_description=task_description,
+            artifacts=artifacts,
+            requirements=requirements,
+            execution_result=execution_result,
+            sender=self.agent_name,
+            priority=priority,
+            timeout_ms=timeout_ms,
+        )
+
+        return self._bus.send_to_role(
+            recipient_role=AgentRole.TESTER,
             message=message,
             wait_for_response=True,
             timeout_ms=timeout_ms,
@@ -466,6 +547,14 @@ def create_executor_communicator(
 ) -> ExecutorCommunicator:
     """Create an executor communicator."""
     return ExecutorCommunicator(agent_name, message_bus)
+
+
+def create_tester_communicator(
+    agent_name: str = "tester",
+    message_bus: Optional[MessageBus] = None,
+) -> TesterCommunicator:
+    """Create a tester communicator."""
+    return TesterCommunicator(agent_name, message_bus)
 
 
 def create_agent_communicator(

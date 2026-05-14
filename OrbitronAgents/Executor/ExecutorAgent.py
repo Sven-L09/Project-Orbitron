@@ -92,7 +92,7 @@ class ExecutorAgent:
         agent_name: str = "executor",
         workspace_root: str | None = None,
         kernel=None,
-        max_rounds: int = 25,
+        max_rounds: int = 20,
     ):
         """Initialize the Executor Agent.
 
@@ -120,6 +120,10 @@ class ExecutorAgent:
         # Legacy skills (kept for backward compatibility)
         self._register_default_skills()
 
+        # Register skill tools into autonomous agent (must be after _register_default_skills)
+        if self._autonomous_agent:
+            self._register_skill_tools("word")
+
         logger.info("[ExecutorAgent] Initialized: %s (autonomous_mode=%s)", self.agent_name, self.autonomous_mode)
         logger.info("[ExecutorAgent] Workspace: %s", self.workspace_root)
 
@@ -133,10 +137,32 @@ class ExecutorAgent:
 You are the system's intelligent builder and implementer. You write code, create files, execute commands, and verify your work.
 You do NOT plan or strategize — that is the Planner's job. You receive a goal and IMPLEMENT it.
 
+## CRITICAL: Time Management
+You have LIMITED rounds. You MUST call `submit_result` within 10-15 rounds.
+- Round 1-2: Read ONLY the most critical files (max 2-3 files). Do NOT read the entire project.
+- Round 3-8: Create/modify files to implement the goal. ACT FIRST, verify later.
+- Round 8-12: **BUILD AND VERIFY** — Run the build/compile command and check for errors. Fix any errors.
+- Round 12-15: Fix any remaining issues and call `submit_result`.
+- Do NOT read more than 5 files total. If you need context, read the KEY file and start implementing.
+- A working implementation that COMPILES is better than a perfect implementation that never completes.
+
+## CRITICAL: Build Verification (MANDATORY)
+Before calling `submit_result`, you MUST verify that your changes compile/build correctly:
+- For Angular projects: Run `ng build` or `npx ng build` and check for compilation errors
+- For Node.js projects: Run `npm run build` or `npm start` and check for errors
+- For Python projects: Run `python -m py_compile <file>` or `pytest` to check
+- For web projects: Start the dev server (`npm start`, `ng serve`, etc.) and verify it starts
+- If the build FAILS, you MUST fix the errors before submitting. Do NOT submit broken code.
+- If you cannot fix all errors within your remaining rounds, still call `submit_result` but note the remaining issues.
+
+## CRITICAL: You MUST Create/Modify Files
+Your job is to IMPLEMENT changes, not just ANALYZE the codebase. You MUST use `create_file` or `update_file` at least once before calling `submit_result`. If you call `submit_result` without having created or modified any files, that is a FAILURE. Reading files and reporting "looks good" is NOT acceptable.
+
 ## Your Capabilities
 - Read files and directories to understand context
 - Search the codebase for patterns and references
 - Create, update, and delete files
+- Create professional Word documents and reports
 - Run shell commands and Python scripts
 - Check syntax of code files
 - Run tests to verify correctness
@@ -144,28 +170,24 @@ You do NOT plan or strategize — that is the Planner's job. You receive a goal 
 - Review your own work before submission
 
 ## Workflow
-1. **Context Gathering**: Read relevant files, list directories, search for patterns to understand the codebase.
+1. **Context Gathering**: Read 1-2 KEY files only. Do NOT explore the entire project structure.
 2. **Implementation**: Create and modify files. Write complete, production-ready code.
-3. **Verification**: Run syntax checks and tests. If they fail, fix the issues.
-4. **Review**: Read your created files and ensure they are correct and consistent. Check for:
-   - Missing references (does HTML link to CSS/JS that exists?)
-   - Null pointer errors in JS (does `getElementById` return null for elements not on the current page?)
-   - localStorage usage on `file://` URLs (wrap in try/catch)
-   - Cross-page consistency (navigation, shared styles)
-5. **Submission**: When satisfied, call `submit_result` with a summary.
+3. **Build Verification**: Run the build command (e.g., `ng build`, `npm run build`) and check for errors.
+4. **Fix Errors**: If the build fails, read the error messages and fix the issues.
+5. **Submission**: When the build succeeds OR you've exhausted your rounds, call `submit_result`.
 
 ## Important Rules
 - Write COMPLETE, working code — no placeholders, no TODOs
 - Follow existing patterns and conventions in the codebase
 - Handle edge cases appropriately
 - Keep code clean, readable, and maintainable
-- Test your code if possible
+- ALWAYS verify your code compiles/builds before submitting
 - If unsure about a requirement, you may call `ask_question`
 - When done, ALWAYS call `submit_result` to finish
 
 ## Tool Guidelines
-- `read_file`: Read existing code to understand context before modifying
-- `list_directory`: Explore project structure
+- `read_file`: Read existing code to understand context before modifying — but read ONLY what you need
+- `list_directory`: Explore project structure — use SPARINGLY, only to find key files
 - `search_files`: Find patterns, usages, or references
 - `create_file`: Create new files with complete content
 - `update_file`: Edit existing files — THREE MODES:
@@ -173,9 +195,13 @@ You do NOT plan or strategize — that is the Planner's job. You receive a goal 
   - **Append**: Provide `content` + `append=true` to add content to the end of a file (e.g., adding new CSS styles, appending functions).
   - **Full Overwrite**: Provide `content` only — replaces the ENTIRE file. Use ONLY for complete rewrites.
 - `delete_file`: Remove files when needed
-- `run_command`: Execute shell commands (e.g., npm install, pip install)
+- `run_command`: Execute shell commands — USE THIS TO BUILD AND VERIFY YOUR CODE (e.g., `cd project && npm run build`, `ng build`)
 - `check_syntax`: Validate your code before running tests
 - `run_tests`: Run tests to verify correctness
+- `web_search`: Search the web for documentation, APIs, or solutions to errors
+- `web_fetch`: Fetch and read web pages for reference documentation
+- `create_document`: Create a professional Word document from Markdown content
+- `create_report`: Create a structured Word report with a title and multiple sections
 - `submit_result`: **TERMINAL TOOL** — Call this when you are satisfied with your work
 - `ask_question`: **TERMINAL TOOL** — Call this if you need clarification
 
@@ -191,6 +217,7 @@ You do NOT plan or strategize — that is the Planner's job. You receive a goal 
             system_prompt=system_prompt,
             kernel=self.kernel,
             max_rounds=self.max_rounds,
+            urgency_threshold=0.5,
         )
 
         # Register all standard tools
@@ -200,6 +227,39 @@ You do NOT plan or strategize — that is the Planner's job. You receive a goal 
         self._autonomous_agent.register_syntax_tool()
         self._autonomous_agent.register_test_tool()
         self._autonomous_agent.register_git_tools()
+
+        # Register word document generation tools from skills
+        # (Skills must be registered first via _register_default_skills,
+        #  which happens in __init__ after this method. So we defer this
+        #  registration to be called after skills are set up.)
+        # self._register_skill_tools("word")  -- moved to __init__
+
+        # Register web search/fetch tools for looking up documentation
+        self._autonomous_agent.register_tool(
+            name="web_search",
+            description="Search the web for information. Useful for looking up documentation, APIs, library usage, error solutions, and best practices.",
+            schema={
+                "type": "object",
+                "required": ["query"],
+                "properties": {
+                    "query": {"type": "string", "description": "The search query string"},
+                    "max_results": {"type": "integer", "description": "Maximum number of results to return (1-10, default 5)", "default": 5},
+                },
+            },
+            handler=lambda args: self.kernel._dispatch_tool("web_search", args) if self.kernel else {"ok": False, "error": "No kernel available"},
+        )
+        self._autonomous_agent.register_tool(
+            name="web_fetch",
+            description="Fetch and read a web page by URL. Useful for reading documentation pages, API references, or tutorials.",
+            schema={
+                "type": "object",
+                "required": ["url"],
+                "properties": {
+                    "url": {"type": "string", "description": "The URL of the web page to fetch"},
+                },
+            },
+            handler=lambda args: self.kernel._dispatch_tool("web_fetch", args) if self.kernel else {"ok": False, "error": "No kernel available"},
+        )
 
         # Register submit_result terminal tool
         self._submit_result_data: Optional[dict[str, Any]] = None
@@ -291,28 +351,62 @@ You do NOT plan or strategize — that is the Planner's job. You receive a goal 
             max_rounds=self.max_rounds,
         )
 
+        # Collect artifacts from tool calls in the autonomous loop
+        loop_artifacts = []
+        file_operations = loop_result.file_operations if hasattr(loop_result, 'file_operations') else []
+        if not file_operations and hasattr(self._autonomous_agent, '_file_operations'):
+            file_operations = self._autonomous_agent._file_operations
+        for op in file_operations:
+            path = op.get("path", "")
+            action = op.get("action", "")
+            if path and action in ("create_file", "update_file") and path not in loop_artifacts:
+                loop_artifacts.append(path)
+                state.record_file_created(path, op.get("size_bytes", 0))
+            elif path and action == "delete_file":
+                state.record_file_deleted(path)
+
         # Build result from loop output
         if self._submit_result_data:
+            submitted_success = self._submit_result_data.get("success", True)
+            # If no files were created/modified and the task was to fix/implement something,
+            # override success to False — reading files is not implementing
+            if not loop_artifacts and submitted_success:
+                logger.warning("[ExecutorAgent] submit_result called with success=True but no files created — overriding to success=False")
+                submitted_success = False
             result = ExecutionResult(
-                success=self._submit_result_data.get("success", True),
+                success=submitted_success,
                 summary=self._submit_result_data.get("summary", ""),
-                artifacts=self._submit_result_data.get("artifacts", []),
+                artifacts=self._submit_result_data.get("artifacts", []) or loop_artifacts,
                 tool_calls=loop_result.tool_calls_made,
                 rounds=loop_result.rounds_used,
             )
-        elif loop_result.done:
-            # Loop finished without submit_result — use the content as summary
+        elif loop_result.done and loop_result.content:
+            # Loop finished naturally — use the content as summary
             result = ExecutionResult(
                 success=True,
-                summary=loop_result.content,
+                summary=loop_result.content[:500],
+                artifacts=loop_artifacts,
+                tool_calls=loop_result.tool_calls_made,
+                rounds=loop_result.rounds_used,
+            )
+        elif loop_artifacts:
+            # Loop exceeded max_rounds but files were created — treat as partial success
+            logger.warning(
+                "[ExecutorAgent] Max rounds exceeded but %d file(s) were created. Treating as partial success.",
+                len(loop_artifacts),
+            )
+            result = ExecutionResult(
+                success=True,
+                summary=f"Implementation completed {len(loop_artifacts)} file(s) but ran out of rounds before calling submit_result.",
+                artifacts=loop_artifacts,
                 tool_calls=loop_result.tool_calls_made,
                 rounds=loop_result.rounds_used,
             )
         else:
             result = ExecutionResult(
                 success=False,
-                summary=loop_result.content,
-                error="Execution did not complete successfully",
+                summary=loop_result.content[:500] if loop_result.content else "",
+                error="Execution did not complete successfully and no files were created",
                 tool_calls=loop_result.tool_calls_made,
                 rounds=loop_result.rounds_used,
             )
@@ -517,6 +611,26 @@ You receive a plan step and implement it with high-quality code.
     def get_skill(self, name: str) -> Optional[Any]:
         """Get a registered skill by name."""
         return self.skills.get(name)
+
+    def _register_skill_tools(self, skill_name: str) -> None:
+        """Register all tools from a skill into the autonomous agent."""
+        skill = self.skills.get(skill_name)
+        if not skill or not self._autonomous_agent:
+            return
+        handlers = skill.get_handlers()
+        for tool_schema in skill.get_tools():
+            func_info = tool_schema.get("function", {})
+            tool_name = func_info.get("name")
+            description = func_info.get("description", "")
+            parameters = func_info.get("parameters", {})
+            handler = handlers.get(tool_name)
+            if tool_name and handler:
+                self._autonomous_agent.register_tool(
+                    name=tool_name,
+                    description=description,
+                    schema=parameters,
+                    handler=handler,
+                )
 
     # ========== Execution State Management ==========
 

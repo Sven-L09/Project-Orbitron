@@ -51,11 +51,11 @@ class TimeoutManager:
     """
 
     # Default timeout bounds
-    MIN_TIMEOUT_SECONDS = 1800  # 30 minutes minimum
-    MAX_TIMEOUT_SECONDS = 3600  # 1 hour maximum
+    MIN_TIMEOUT_SECONDS = 30    # 30 seconds minimum
+    MAX_TIMEOUT_SECONDS = 600   # 10 minutes maximum
 
     # Base calculations
-    BASE_TIMEOUT_SECONDS = 1800  # 30 minutes base
+    BASE_TIMEOUT_SECONDS = 180  # 3 minutes base
     PER_STEP_SECONDS = 60  # 1 minute per plan step
     PER_TOKEN_ESTIMATE_SECONDS = 0.02  # 20ms per expected token
 
@@ -289,13 +289,13 @@ class TimeoutManager:
     def get_average_duration_per_step(self) -> float:
         """Calculate average duration per step from history."""
         if not self._history:
-            return self.PER_STEP_SECONDS / 0.5  # Default estimate
+            return self.PER_STEP_SECONDS * 0.5  # Default estimate
 
         total_steps = sum(h.num_steps for h in self._history)
         total_duration = sum(h.actual_duration_seconds for h in self._history)
 
         if total_steps == 0:
-            return self.PER_STEP_SECONDS / 0.5
+            return self.PER_STEP_SECONDS * 0.5
 
         return total_duration / total_steps
 

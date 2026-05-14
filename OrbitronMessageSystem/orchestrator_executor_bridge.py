@@ -60,63 +60,53 @@ class OrchestratorExecutorBridge:
         self,
         plan: dict[str, Any],
         context: Optional[dict[str, Any]] = None,
-        timeout_seconds: int = 3600,
+        timeout_seconds: int = 900,
+        max_retries: int = 1,
     ) -> dict[str, Any]:
         """Request execution of a plan from the Executor Agent.
-        
+
         This is a synchronous call that waits for the Executor to complete.
-        
+        If the request times out, it will be retried up to max_retries times.
+
         Args:
             plan: The plan to execute (from Planner)
             context: Additional context (files, constraints, etc.)
-            timeout_seconds: Maximum time to wait for execution
-            
+            timeout_seconds: Maximum time to wait for execution (default 15 min)
+            max_retries: Number of retries after timeout (default 1)
+
         Returns:
             Dictionary containing the execution results
-            
-        Example:
-            ```python
-            bridge = OrchestratorExecutorBridge()
-            result = bridge.request_execution(
-                plan={
-                    "steps": [
-                        {
-                            "id": "1",
-                            "description": "Create main.py",
-                            "skill": "programming",
-                            "action": "create_file",
-                            "args": {"filename": "main.py", "content": "..."}
-                        }
-                    ]
-                },
-                context={"workspace": "/path/to/workspace"}
-            )
-            
-            if result["success"]:
-                print(f"Execution completed: {result['steps_executed']} steps")
-            ```
         """
         logger.info("[OrchestratorExecutorBridge] Requesting execution for plan with %d steps", len(plan.get('steps', [])))
-        
-        # Send execution request and wait for response
-        response = self._communicator.send_command(
-            command="execute_plan",
-            args={
-                "plan": plan,
-                "context": context or {},
-            },
-            recipient_role=AgentRole.EXECUTOR,
-            wait_for_response=True,
-            timeout_ms=timeout_seconds * 1000,
-        )
-        
-        if response is None:
-            return {
-                "success": False,
-                "error": "Execution timed out or no response from Executor",
-                "execution_result": None,
-            }
-        
+
+        for attempt in range(max_retries + 1):
+            if attempt > 0:
+                logger.warning("[OrchestratorExecutorBridge] Retrying execution (attempt %d/%d)", attempt + 1, max_retries + 1)
+
+            response = self._communicator.send_command(
+                command="execute_plan",
+                args={
+                    "plan": plan,
+                    "context": context or {},
+                },
+                recipient_role=AgentRole.EXECUTOR,
+                wait_for_response=True,
+                timeout_ms=timeout_seconds * 1000,
+            )
+
+            if response is not None:
+                break
+
+            logger.warning("[OrchestratorExecutorBridge] Execution timed out (attempt %d/%d)", attempt + 1, max_retries + 1)
+            if attempt < max_retries:
+                logger.info("[OrchestratorExecutorBridge] Retrying execution request...")
+            else:
+                return {
+                    "success": False,
+                    "error": f"Execution timed out after {max_retries + 1} attempts ({timeout_seconds}s each)",
+                    "execution_result": None,
+                }
+
         # Parse response
         payload = response.payload if hasattr(response, "payload") and isinstance(response.payload, dict) else {}
         metadata = response.metadata if hasattr(response, "metadata") and isinstance(response.metadata, dict) else {}

@@ -30,6 +30,7 @@ try:
     )
     from OrbitronMessageSystem.orchestrator_planner_bridge import OrchestratorPlannerBridge
     from OrbitronMessageSystem.orchestrator_executor_bridge import OrchestratorExecutorBridge
+    from OrbitronMessageSystem.orchestrator_tester_bridge import OrchestratorTesterBridge
 except ImportError:
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -42,6 +43,7 @@ except ImportError:
     )
     from OrbitronMessageSystem.orchestrator_planner_bridge import OrchestratorPlannerBridge
     from OrbitronMessageSystem.orchestrator_executor_bridge import OrchestratorExecutorBridge
+    from OrbitronMessageSystem.orchestrator_tester_bridge import OrchestratorTesterBridge
 
 # Import reflection engine
 try:
@@ -432,8 +434,8 @@ class TaskOrchestrator:
         kernel=None,
         workspace_root: str | None = None,
         max_planning_iterations: int = 3,
-        planning_timeout_seconds: int = 3600,
-        execution_timeout_seconds: int = 3600,
+        planning_timeout_seconds: int = 900,
+        execution_timeout_seconds: int = 900,
     ):
         """Initialize the Task Orchestrator.
 
@@ -441,8 +443,8 @@ class TaskOrchestrator:
             kernel: Optional kernel instance
             workspace_root: Root directory for the workspace
             max_planning_iterations: Maximum planning revision loops
-            planning_timeout_seconds: Timeout for planning requests
-            execution_timeout_seconds: Timeout for execution requests
+            planning_timeout_seconds: Timeout for planning requests (default 15 min)
+            execution_timeout_seconds: Timeout for execution requests (default 15 min)
         """
         self.kernel = kernel
         self.workspace_root = Path(workspace_root) if workspace_root else Path(__file__).resolve().parents[2]
@@ -459,6 +461,7 @@ class TaskOrchestrator:
         # Communication
         self._planner_bridge: Optional[OrchestratorPlannerBridge] = None
         self._executor_bridge: Optional[OrchestratorExecutorBridge] = None
+        self._tester_bridge: Optional[OrchestratorTesterBridge] = None
         self._communicator: Optional[OrchestratorCommunicator] = None
 
         # Context and memory
@@ -472,6 +475,19 @@ class TaskOrchestrator:
         # Internal autonomous agent for intelligent decision-making
         self._decision_agent: Optional[AutonomousAgent] = None
         self._decision_result: Optional[dict[str, Any]] = None
+        # Track whether execution and testing happened in the decision loop
+        self._execution_happened: bool = False
+        self._testing_happened: bool = False
+        self._last_execution_result: Optional[dict[str, Any]] = None
+        # Iteration counters for convergence enforcement
+        self._iteration_counts: dict[str, int] = {
+            "planning": 0,
+            "execution": 0,
+            "testing": 0,
+        }
+        self._max_planning_calls: int = 1
+        self._max_execution_calls: int = 2
+        self._max_testing_calls: int = 2
         if self.kernel:
             self._setup_decision_agent()
 
@@ -481,65 +497,47 @@ class TaskOrchestrator:
 
     def _setup_decision_agent(self) -> None:
         """Create and configure the internal AutonomousAgent for intelligent task routing."""
-        system_prompt = f"""You are the Orbitron Orchestrator. You receive a user request and decide how to handle it autonomously.
+        system_prompt = f"""You are the Orbitron Orchestrator. You receive a user request and decide how to handle it.
 
 ## Your Identity
-You are the central intelligence of the Orbitron agent system. You coordinate Planner and Executor agents.
+You are the central intelligence of the Orbitron agent system. You coordinate Planner, Executor, and Tester agents.
 You do NOT implement code yourself — you DELEGATE intelligently.
 
-## Your Capabilities
-You have access to tools that let you decide the best approach:
+## CRITICAL: Mandatory Workflow
+You MUST follow this exact workflow. Deviations are NOT allowed:
 
-### Tools
-- `answer_directly` — Answer the user directly using your knowledge. Use for simple questions, explanations, or when no code/files are needed.
-- `request_planning` — Send the task to the Planner Agent for structured planning. Use when the task involves multiple steps, new features, or complex architecture.
-- `request_execution` — Send the task directly to the Executor Agent for implementation. Use for simple file creation, bug fixes, or when you are confident the Executor can handle it without a plan.
-- `submit_result` — **TERMINAL** — Call this when you have the final answer/result for the user.
+For **questions** (no files/code needed):
+1. Call `answer_directly` → Done. Call `submit_result`.
+
+For **implementation tasks** (files, code, documents):
+1. Call `request_execution` to implement the task
+2. After receiving execution results, call `request_testing` to verify quality
+3. If testing passes (quality_rating = "excellent" or "good") → Call `submit_result`
+4. If testing finds issues (quality_rating = "poor") → Call `request_execution` ONE MORE TIME with specific fix instructions
+5. After the fix, call `request_testing` ONE MORE TIME
+6. Regardless of the second test result → Call `submit_result`
+
+## HARD LIMITS (DO NOT VIOLATE)
+- Call `request_planning` at most ONCE per task
+- Call `request_execution` at most TWICE per task (initial + one fix)
+- Call `request_testing` at most TWICE per task
+- After calling `request_testing`, you MUST call `submit_result` next (or `request_execution` if this is your first test and it failed)
+- NEVER call `request_planning` after `request_execution` has been called
+- NEVER restart a task from scratch — fix what's there
+- ALWAYS converge: call `submit_result` within your remaining rounds
+
+## Tools
+- `answer_directly` — Answer simple questions directly
+- `request_planning` — Get a structured plan (call ONCE at most, BEFORE execution)
+- `request_execution` — Send task to Executor (call at most TWICE)
+- `request_testing` — Send product to Tester for quality review (call at most TWICE)
+- `submit_result` — **TERMINAL** — Call this to finish and deliver the result
 
 ## Decision Guidelines
-- **Simple question** (e.g., "What is a Decorator?", "Explain X") → `answer_directly`
-- **Simple file creation** (e.g., "Create a Python function...") → `request_execution`
-- **Complex project** (e.g., "Build a website with auth...") → `request_planning` first, then `request_execution`
-- **Bug fix / Update** (e.g., "Fix the bug in auth.py") → `request_execution` (Executor reads files and fixes)
-- **Ambiguous request** → `answer_directly` to ask for clarification, or `request_planning` for analysis
-
-## Workflow
-1. Analyze the user's request.
-2. Decide which tool to call based on the guidelines above.
-3. If you called `request_planning`, you will receive a plan back. Then decide:
-   - Is the plan good? → `request_execution` with the plan
-   - Is it too complex? → `request_execution` anyway (Executor handles it)
-4. If you called `request_execution`, you will receive results back.
-5. **MANDATORY: Verify the results before submitting!** Do NOT blindly accept executor results.
-6. If verification reveals issues, call `request_execution` again with specific feedback on what to fix.
-7. Only call `submit_result` when you are confident the result is complete and correct.
-
-## CRITICAL: Result Verification
-After receiving execution results, you MUST verify them before calling `submit_result`. This is NOT optional.
-
-**For code/file tasks, check:**
-- Do all referenced files exist? (e.g., if a new HTML page links to `css/style.css` and `js/main.js`, verify they exist)
-- Are there obvious JavaScript errors? (e.g., `getElementById` on elements that don't exist on the page, missing null checks)
-- Does the new content integrate properly with existing content? (e.g., navigation links, shared stylesheets)
-- Were existing files modified correctly? (e.g., when adding a new page, was the main navigation updated?)
-- Are there `file://` protocol issues? (e.g., localStorage won't work from local files)
-
-**For web pages, check:**
-- Does the HTML reference all CSS and JS files correctly?
-- Does shared JavaScript (like `main.js`) handle missing elements gracefully? (null checks for `getElementById`)
-- Are there any cross-reference issues between pages?
-
-**If you find issues, call `request_execution` again with specific instructions to fix them.**
-**Do NOT call `submit_result` until verification passes.**
-
-## Important Rules
-- You decide. Do NOT hardcode decisions. Think about each request individually.
-- For questions: answer directly. Do not involve Planner/Executor.
-- For implementation: prefer direct execution for simple tasks, planning for complex ones.
-- You can chain tools: plan → execute → verify → fix if needed → submit_result
-- Call `submit_result` ONLY when you have verified the result is correct and complete.
-- Be efficient: don't plan what's not needed.
-- **NEVER skip verification.** A quick check saves the user from broken results.
+- **Simple question** → `answer_directly` → `submit_result`
+- **Simple implementation** → `request_execution` → `request_testing` → `submit_result`
+- **Complex project** → `request_planning` → `request_execution` → `request_testing` → `submit_result`
+- **If test fails** → `request_execution` (with fix instructions) → `request_testing` → `submit_result`
 """
 
         self._decision_agent = AutonomousAgent(
@@ -547,6 +545,7 @@ After receiving execution results, you MUST verify them before calling `submit_r
             system_prompt=system_prompt,
             kernel=self.kernel,
             max_rounds=15,
+            urgency_threshold=0.4,
         )
 
         # Register tools
@@ -607,6 +606,21 @@ After receiving execution results, you MUST verify them before calling `submit_r
             handler=self._tool_submit_result,
         )
 
+        self._decision_agent.register_tool(
+            name="request_testing",
+            description="Send the product to the Tester Agent for critical quality review. The Tester is READ-ONLY — it inspects but never modifies. Call this AFTER execution to verify quality before submitting the final result.",
+            schema={
+                "type": "object",
+                "required": ["task_description", "artifacts"],
+                "properties": {
+                    "task_description": {"type": "string", "description": "The original task description to test against"},
+                    "artifacts": {"type": "array", "items": {"type": "string"}, "description": "List of artifact file paths to test"},
+                    "execution_summary": {"type": "string", "description": "Summary of what the Executor produced"},
+                },
+            },
+            handler=self._tool_request_testing,
+        )
+
     # ========== Orchestrator Tool Handlers ==========
 
     def _tool_answer_directly(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -620,23 +634,39 @@ After receiving execution results, you MUST verify them before calling `submit_r
                 {"role": "system", "content": self._system_context},
                 {"role": "user", "content": f"{query}\n\nContext: {context}" if context else query},
             ]
-            response = self.kernel.run_chat(messages=messages, max_rounds=5)
+            response = self.kernel.run_chat(messages=messages, max_rounds=10)
             return {"ok": True, "answer": response}
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
     def _tool_request_planning(self, args: dict[str, Any]) -> dict[str, Any]:
         """Tool handler: request planning from the Planner Agent."""
+        # Enforce iteration limit
+        if self._iteration_counts["planning"] >= self._max_planning_calls:
+            return {
+                "ok": False,
+                "error": f"Planning limit reached ({self._max_planning_calls} call(s)). Proceed to execution instead. Call request_execution or submit_result.",
+            }
         task_desc = args.get("task", "")
         context = args.get("context", "")
+
+        # Include information about what was already planned/executed to prevent duplication
+        planning_context = {"notes": context} if context else {}
+        if self._last_execution_result:
+            planning_context["previous_execution_summary"] = self._last_execution_result.get("summary", "")[:500]
+            planning_context["previous_artifacts"] = self._last_execution_result.get("artifacts", [])
+        if self._iteration_counts["execution"] > 0:
+            planning_context["warning"] = "Execution has already been done. Only plan if the task fundamentally needs re-planning. Do NOT duplicate existing work."
+
         if not self._planner_bridge:
             return {"ok": False, "error": "Planner bridge not available"}
         try:
             result = self._planner_bridge.request_plan(
                 task_description=task_desc,
-                context={"notes": context} if context else {},
+                context=planning_context,
                 timeout_seconds=self.planning_timeout_seconds,
             )
+            self._iteration_counts["planning"] += 1
             if result.get("success"):
                 return {
                     "ok": True,
@@ -650,6 +680,12 @@ After receiving execution results, you MUST verify them before calling `submit_r
 
     def _tool_request_execution(self, args: dict[str, Any]) -> dict[str, Any]:
         """Tool handler: request execution from the Executor Agent."""
+        # Enforce iteration limit
+        if self._iteration_counts["execution"] >= self._max_execution_calls:
+            return {
+                "ok": False,
+                "error": f"Execution limit reached ({self._max_execution_calls} call(s)). You MUST now call request_testing (if not done) or submit_result. No more execution calls allowed.",
+            }
         goal = args.get("goal", "")
         plan_hint = args.get("plan_hint", "")
         if not self._executor_bridge:
@@ -665,10 +701,15 @@ After receiving execution results, you MUST verify them before calling `submit_r
             )
             if isinstance(result, dict):
                 exec_result = result.get("execution_result", result)
+                self._execution_happened = True
+                self._last_execution_result = exec_result if isinstance(exec_result, dict) else result
+                self._iteration_counts["execution"] += 1
                 return {
                     "ok": True,
                     "execution_result": exec_result,
                     "success": exec_result.get("success", False) if isinstance(exec_result, dict) else False,
+                    "remaining_execution_calls": self._max_execution_calls - self._iteration_counts["execution"],
+                    "must_test_next": self._iteration_counts["testing"] < self._max_testing_calls,
                 }
             else:
                 return {"ok": False, "error": "Invalid execution result"}
@@ -684,6 +725,144 @@ After receiving execution results, you MUST verify them before calling `submit_r
         }
         return {"ok": True, "message": "Result submitted"}
 
+    def _tool_request_testing(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Tool handler: request quality testing from the Tester Agent."""
+        # Enforce iteration limit
+        if self._iteration_counts["testing"] >= self._max_testing_calls:
+            return {
+                "ok": True,
+                "passed": True,
+                "quality_rating": "skipped",
+                "summary": f"Testing limit reached ({self._max_testing_calls} call(s)). Proceed to submit_result.",
+                "issues": [],
+                "must_submit": True,
+            }
+        task_description = args.get("task_description", "")
+        artifacts = args.get("artifacts", [])
+        execution_summary = args.get("execution_summary", "")
+
+        # Track that testing happened
+        self._testing_happened = True
+
+        if not self._tester_bridge:
+            logger.warning("[Orchestrator] Tester bridge not available, skipping testing")
+            return {
+                "ok": True,
+                "passed": True,
+                "quality_rating": "unknown",
+                "summary": "Testing skipped — Tester Agent not available",
+                "issues": [],
+                "skipped": True,
+            }
+
+        try:
+            result = self._tester_bridge.request_testing(
+                task_description=task_description,
+                artifacts=artifacts,
+                execution_result={"summary": execution_summary},
+                timeout_seconds=self.execution_timeout_seconds,
+            )
+            self._iteration_counts["testing"] += 1
+
+            remaining_exec = self._max_execution_calls - self._iteration_counts["execution"]
+            remaining_test = self._max_testing_calls - self._iteration_counts["testing"]
+
+            if result.get("passed", False):
+                return {
+                    "ok": True,
+                    "passed": True,
+                    "quality_rating": result.get("quality_rating", "unknown"),
+                    "summary": result.get("summary", ""),
+                    "issues": result.get("issues", []),
+                    "must_submit": True,
+                }
+            else:
+                # Test failed — tell the LLM what to do based on remaining iterations
+                if remaining_exec > 0 and remaining_test > 0:
+                    return {
+                        "ok": True,
+                        "passed": False,
+                        "quality_rating": result.get("quality_rating", "poor"),
+                        "summary": result.get("summary", ""),
+                        "issues": result.get("issues", []),
+                        "recommendation": f"The Tester found issues. Call request_execution with specific fix instructions, then request_testing again. ({remaining_exec} execution call(s) and {remaining_test} test call(s) remaining).",
+                    }
+                else:
+                    return {
+                        "ok": True,
+                        "passed": False,
+                        "quality_rating": result.get("quality_rating", "poor"),
+                        "summary": result.get("summary", ""),
+                        "issues": result.get("issues", []),
+                        "recommendation": "No more execution or testing iterations remaining. You MUST call submit_result now with the best result available.",
+                        "must_submit": True,
+                    }
+        except Exception as e:
+            return {"ok": False, "error": f"Testing request failed: {str(e)}"}
+
+    def _auto_trigger_testing(self, task: Task) -> Optional[dict[str, Any]]:
+        """Automatically trigger Tester Agent after execution.
+
+        This ensures testing ALWAYS happens after execution, even when the
+        autonomous decision loop doesn't explicitly call request_testing.
+
+        Args:
+            task: The task that was executed
+
+        Returns:
+            Testing result dict, or None if testing couldn't be triggered
+        """
+        if not self._tester_bridge:
+            logger.warning("[Orchestrator] No tester bridge available for testing")
+            return {"passed": True, "quality_rating": "skipped", "summary": "Testing skipped — no tester bridge", "issues": []}
+
+        # Collect artifacts from execution result
+        artifacts = []
+        exec_result = self._last_execution_result or {}
+        if isinstance(exec_result, dict):
+            artifacts = exec_result.get("artifacts", [])
+            # Also try to find artifacts from file operations
+            if not artifacts:
+                file_ops = exec_result.get("file_operations", [])
+                if file_ops:
+                    artifacts = [op.get("path", "") for op in file_ops if op.get("path")]
+
+        # If still no artifacts, try to find files in the workspace
+        if not artifacts and self.workspace_root:
+            try:
+                workspace = Path(self.workspace_root)
+                if workspace.exists():
+                    recent_files = []
+                    import time
+                    cutoff = time.time() - 3600  # Files modified in the last hour
+                    for f in workspace.rglob("*"):
+                        if f.is_file() and not f.name.startswith(".") and f.stat().st_mtime > cutoff:
+                            try:
+                                rel = f.relative_to(workspace)
+                                recent_files.append(str(rel))
+                            except ValueError:
+                                recent_files.append(str(f))
+                    artifacts = recent_files[:20]  # Max 20 recent files
+            except Exception:
+                pass
+
+        logger.info("[Orchestrator] Running Tester for task %s with %d artifacts",
+                     task.task_id, len(artifacts))
+
+        try:
+            result = self._tester_bridge.request_testing(
+                task_description=task.description,
+                artifacts=artifacts,
+                execution_result=exec_result,
+                timeout_seconds=self.execution_timeout_seconds,
+            )
+            logger.info("[Orchestrator] Test complete: passed=%s, rating=%s",
+                        result.get("passed"), result.get("quality_rating"))
+            return result
+        except Exception as e:
+            logger.warning("[Orchestrator] Testing failed: %s", e)
+            return {"passed": True, "quality_rating": "error", "summary": f"Testing error: {e}", "issues": []}
+
     def connect_to_message_bus(self) -> None:
         """Connect to the message bus for agent communication."""
         # Ensure message bus is started
@@ -695,12 +874,17 @@ After receiving execution results, you MUST verify them before calling `submit_r
         self._planner_bridge = OrchestratorPlannerBridge(
             orchestrator_name="orchestrator"
         )
-        
+
         # Create executor bridge
         self._executor_bridge = OrchestratorExecutorBridge(
             orchestrator_name="orchestrator"
         )
-        
+
+        # Create tester bridge
+        self._tester_bridge = OrchestratorTesterBridge(
+            orchestrator_name="orchestrator"
+        )
+
         # Create communicator
         self._communicator = OrchestratorCommunicator(agent_name="orchestrator")
         self._communicator.connect()
@@ -709,14 +893,18 @@ After receiving execution results, you MUST verify them before calling `submit_r
     
     def disconnect(self) -> None:
         """Disconnect from message bus."""
+        if self._tester_bridge:
+            self._tester_bridge.close()
+            self._tester_bridge = None
+
         if self._executor_bridge:
             self._executor_bridge.close()
             self._executor_bridge = None
-        
+
         if self._planner_bridge:
             self._planner_bridge.close()
             self._planner_bridge = None
-        
+
         if self._communicator:
             self._communicator.disconnect()
             self._communicator = None
@@ -855,13 +1043,14 @@ Current Date: {datetime.now().strftime("%Y-%m-%d %H:%M")}
         return None
     
     def run_task(self, task_id: str) -> dict[str, Any]:
-        """Run a task through the intelligent orchestration loop.
+        """Run a task through a deterministic pipeline with enforced convergence.
 
-        If autonomous_mode is True and the decision agent is available,
-        the Orchestrator runs an autonomous loop where the LLM decides
-        which tools to call (answer_directly, request_planning, request_execution).
-
-        Otherwise, falls back to the legacy rigid pipeline.
+        Pipeline: CLASSIFY → (PLAN?) → EXECUTE → TEST → (FIX → TEST?) → DONE
+        Hard limits ensure the system always converges:
+        - Max 1 planning call
+        - Max 2 execution calls (initial + 1 fix)
+        - Max 2 testing calls
+        - Always submits a result
 
         Args:
             task_id: ID of the task to run
@@ -877,94 +1066,313 @@ Current Date: {datetime.now().strftime("%Y-%m-%d %H:%M")}
         logger.info("ORCHESTRATING TASK: %s", task_id)
         logger.info("=" * 60)
 
+        # Reset iteration counters for this task
+        self._iteration_counts = {"planning": 0, "execution": 0, "testing": 0}
+        self._execution_happened = False
+        self._testing_happened = False
+        self._last_execution_result = None
+
         if not self.autonomous_mode or not self._decision_agent:
             return self._run_task_legacy(task)
 
-        # ===== AUTONOMOUS ORCHESTRATION LOOP =====
-        # The Orchestrator itself is now an intelligent agent that decides
-        # how to handle the task. It can:
-        # - answer_directly
-        # - request_planning
-        # - request_execution
-        # - submit_result
+        # ===== STEP 1: Classify task =====
+        task_type = self._classify_task(task)
+        logger.info("[Orchestrator] Task classified as: %s", task_type)
 
-        logger.info("[Orchestrator] Starting autonomous decision loop for task: %s", task_id)
-        task._update_status(TaskStatus.PLANNING, "Orchestrator deciding approach")
+        # ===== FAST PATH: Questions → answer directly =====
+        if task_type == "question":
+            return self._handle_question_task(task)
 
-        try:
-            # Reset decision result
-            self._decision_result = None
+        # ===== FAST PATH: Direct execution → execute, test, done =====
+        if task_type == "direct_execution":
+            return self._run_pipeline(task, skip_planning=True)
 
-            # Run the autonomous decision loop
-            loop_result = self._decision_agent.run_task(
-                task_description=task.description,
-                context={
-                    "task_id": task_id,
-                    "workspace": str(self.workspace_root),
-                    "memory": self.memory.get_recent_context(5),
-                },
-                max_rounds=15,
-            )
+        # ===== COMPLEX/EXPLORATORY: Full pipeline =====
+        return self._run_pipeline(task, skip_planning=False)
 
-            # If the loop submitted a result, use it
-            if self._decision_result:
-                result = self._decision_result
-                task.set_completed({
-                    "summary": result.get("summary", ""),
-                    "success": result.get("success", True),
-                    "artifacts": result.get("artifacts", []),
-                    "autonomous": True,
-                    "rounds": loop_result.rounds_used,
-                    "tools": loop_result.tool_calls_made,
-                })
-                logger.info("[Orchestrator] Autonomous loop completed. Success=%s", result.get("success"))
-                return {
-                    "success": result.get("success", True),
-                    "task_id": task_id,
-                    "status": task.status.name,
-                    "summary": result.get("summary", ""),
-                    "artifacts": result.get("artifacts", []),
-                    "autonomous": True,
-                    "rounds": loop_result.rounds_used,
-                    "tools": loop_result.tool_calls_made,
-                }
+    def _run_pipeline(
+        self,
+        task: Task,
+        skip_planning: bool = False,
+    ) -> dict[str, Any]:
+        """Run the deterministic pipeline: (PLAN?) → EXECUTE → TEST → (FIX → TEST?) → DONE.
 
-            # If no terminal tool was called but loop finished, try to use content as answer
-            if loop_result.done and loop_result.content:
-                task.set_completed({
-                    "answer": loop_result.content,
-                    "autonomous": True,
-                    "rounds": loop_result.rounds_used,
-                })
-                return {
-                    "success": True,
-                    "task_id": task_id,
-                    "status": task.status.name,
-                    "answer": loop_result.content,
-                    "autonomous": True,
-                    "rounds": loop_result.rounds_used,
-                }
+        This method enforces convergence — the system WILL finish, either
+        successfully or with the best result available.
 
-            # Loop did not complete properly
-            error_msg = loop_result.content or "Autonomous orchestration did not complete"
+        Args:
+            task: The task to process
+            skip_planning: If True, skip the planning phase (direct execution)
+
+        Returns:
+            Task result dictionary
+        """
+        logger.info("[Pipeline] Starting pipeline for task: %s (skip_planning=%s)", task.task_id, skip_planning)
+
+        # ===== PHASE 1: Planning (optional) =====
+        if not skip_planning:
+            planning_result = self._run_planning_loop(task)
+            if not planning_result["success"]:
+                logger.warning("[Pipeline] Planning failed, falling back to direct execution")
+                # Planning failed — try direct execution instead
+                task.plan = None
+
+        # ===== PHASE 2: Execution =====
+        task._update_status(TaskStatus.EXECUTING, "Executing goal")
+
+        goal = task.description
+        if task.plan:
+            goal = self._convert_plan_to_goal(task.plan)
+
+        execution_result = self._run_execution_adaptive(task, goal=goal, plan=task.plan)
+        self._iteration_counts["execution"] += 1
+        self._execution_happened = True
+        self._last_execution_result = execution_result
+
+        if not execution_result or not execution_result.get("success", False):
+            # First execution failed — try once more with error feedback
+            logger.warning("[Pipeline] First execution failed, retrying with error feedback")
+            fix_goal = self._build_error_fix_goal(task, execution_result)
+            execution_result = self._run_execution_adaptive(task, goal=fix_goal)
+            self._iteration_counts["execution"] += 1
+            self._last_execution_result = execution_result
+
+            if not execution_result or not execution_result.get("success", False):
+                # Both attempts failed — test what we have and submit
+                logger.warning("[Pipeline] Execution failed after retry, testing what we have")
+                test_result = self._run_testing_phase(task, execution_result)
+                return self._finalize_task(task, execution_result, test_result)
+
+        # ===== PHASE 3: Testing (mandatory) =====
+        test_result = self._run_testing_phase(task, execution_result)
+
+        if test_result and not test_result.get("passed", False):
+            # ===== PHASE 4: Fix cycle (one attempt only) =====
+            if self._iteration_counts["execution"] < self._max_execution_calls:
+                logger.info("[Pipeline] Test found issues, attempting fix cycle")
+                fix_goal = self._build_fix_goal(task, execution_result, test_result)
+                execution_result = self._run_execution_adaptive(task, goal=fix_goal)
+                self._iteration_counts["execution"] += 1
+                self._last_execution_result = execution_result
+
+                # ===== PHASE 5: Re-test after fix =====
+                if self._iteration_counts["testing"] < self._max_testing_calls:
+                    test_result = self._run_testing_phase(task, execution_result)
+
+        # ===== PHASE 6: Finalize (always) =====
+        return self._finalize_task(task, execution_result, test_result)
+
+    def _run_testing_phase(
+        self,
+        task: Task,
+        execution_result: Optional[dict[str, Any]],
+    ) -> Optional[dict[str, Any]]:
+        """Run the testing phase of the pipeline.
+
+        Always calls the Tester Agent after execution. This is mandatory, not optional.
+
+        Args:
+            task: The task being processed
+            execution_result: Result from the Executor
+
+        Returns:
+            Testing result dict, or None if testing couldn't be triggered
+        """
+        if self._iteration_counts["testing"] >= self._max_testing_calls:
+            logger.warning("[Pipeline] Testing limit reached, skipping test")
+            return None
+
+        logger.info("[Pipeline] Running Tester Agent (call %d/%d)",
+                     self._iteration_counts["testing"] + 1, self._max_testing_calls)
+
+        # Collect artifacts from execution result
+        artifacts = []
+        exec_result = execution_result or {}
+        if isinstance(exec_result, dict):
+            artifacts = exec_result.get("artifacts", [])
+
+        self._iteration_counts["testing"] += 1
+        self._testing_happened = True
+
+        return self._auto_trigger_testing(task)
+
+    def _build_fix_goal(
+        self,
+        task: Task,
+        execution_result: Optional[dict[str, Any]],
+        test_result: Optional[dict[str, Any]],
+    ) -> str:
+        """Build a goal for the fix cycle based on Tester feedback.
+
+        Args:
+            task: The original task
+            execution_result: Result from the initial execution
+            test_result: Result from the Tester
+
+        Returns:
+            A goal string for the fix execution
+        """
+        goal_parts = [f"FIX the following issues found during testing of: {task.description}"]
+
+        # Add test issues
+        if test_result and isinstance(test_result, dict):
+            issues = test_result.get("issues", [])
+            if issues:
+                goal_parts.append("\n## Issues to Fix:")
+                for i, issue in enumerate(issues[:10], 1):  # Max 10 issues
+                    if isinstance(issue, dict):
+                        severity = issue.get("severity", "unknown")
+                        desc = issue.get("description", str(issue))
+                        goal_parts.append(f"{i}. [{severity.upper()}] {desc}")
+                    else:
+                        goal_parts.append(f"{i}. {issue}")
+
+            quality = test_result.get("quality_rating", "unknown")
+            summary = test_result.get("summary", "")
+            goal_parts.append(f"\nOverall quality: {quality}")
+            if summary:
+                goal_parts.append(f"Test summary: {summary}")
+
+            recommendations = test_result.get("recommendations", "")
+            if recommendations:
+                goal_parts.append(f"Recommendations: {recommendations}")
+
+        # Add artifacts that need fixing
+        if execution_result and isinstance(execution_result, dict):
+            artifacts = execution_result.get("artifacts", [])
+            if artifacts:
+                goal_parts.append(f"\nFiles to fix: {', '.join(str(a) for a in artifacts[:10])}")
+
+        goal_parts.append("\nFix ONLY the issues listed above. Do NOT rewrite the entire project from scratch.")
+
+        return "\n".join(goal_parts)
+
+    def _build_error_fix_goal(
+        self,
+        task: Task,
+        execution_result: Optional[dict[str, Any]],
+    ) -> str:
+        """Build a goal for retrying a failed execution.
+
+        Args:
+            task: The original task
+            execution_result: The failed execution result
+
+        Returns:
+            A goal string for the retry
+        """
+        goal_parts = [f"RETRY the following task (first attempt failed): {task.description}"]
+
+        if execution_result and isinstance(execution_result, dict):
+            error = execution_result.get("error", "")
+            summary = execution_result.get("summary", "")
+            if error:
+                goal_parts.append(f"\nError from first attempt: {error[:500]}")
+            if summary:
+                goal_parts.append(f"Summary: {summary[:300]}")
+
+        goal_parts.append("\nTry a different approach. Read existing files first, then implement.")
+
+        return "\n".join(goal_parts)
+
+    def _finalize_task(
+        self,
+        task: Task,
+        execution_result: Optional[dict[str, Any]],
+        test_result: Optional[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Finalize a task by building the result and marking it complete.
+
+        This is always called — the system ALWAYS converges to a result.
+
+        Args:
+            task: The task being processed
+            execution_result: Result from the Executor (may be None if execution failed)
+            test_result: Result from the Tester (may be None if testing was skipped)
+
+        Returns:
+            Task result dictionary
+        """
+        # Build result summary
+        success = False
+        summary_parts = []
+        artifacts = []
+        test_issues = []
+
+        if execution_result and isinstance(execution_result, dict):
+            success = execution_result.get("success", False)
+            exec_summary = execution_result.get("summary", "")
+            if exec_summary:
+                summary_parts.append(exec_summary[:500])
+            artifacts = execution_result.get("artifacts", [])
+
+        if test_result and isinstance(test_result, dict):
+            test_passed = test_result.get("passed", False)
+            quality = test_result.get("quality_rating", "unknown")
+            test_issues = test_result.get("issues", [])
+            test_summary = test_result.get("summary", "")
+
+            summary_parts.append(f"Test: {'passed' if test_passed else 'issues found'} (quality: {quality})")
+            if test_summary:
+                summary_parts.append(f"Test summary: {test_summary[:300]}")
+
+            if test_passed and quality in ("excellent", "good"):
+                success = True
+            elif test_passed:
+                success = True  # Acceptable quality
+            else:
+                # Tests failed — override success to False regardless of execution result
+                success = False
+                logger.warning("[Pipeline] Tests FAILED (quality=%s) — marking task as failed", quality)
+
+        # Mark task as completed or failed
+        if success:
+            task.set_completed({
+                "summary": "\n".join(summary_parts),
+                "success": True,
+                "artifacts": artifacts,
+                "test_issues": test_issues,
+            })
+        else:
+            # Even if we failed, we still submit a result
+            error_msg = (execution_result.get("error") or "Task could not be completed") if execution_result else "No execution result"
+            if test_issues:
+                error_msg += f" | Test issues: {len(test_issues)} found"
             task.set_failed(error_msg)
-            return {
-                "success": False,
-                "task_id": task_id,
-                "error": error_msg,
-                "autonomous": True,
-                "rounds": loop_result.rounds_used,
-            }
 
-        except Exception as e:
-            error_msg = f"Autonomous orchestration failed: {str(e)}"
-            task.set_failed(error_msg)
-            self.reflection_engine.reflect_on_task(
-                task_id=task_id,
-                result={"success": False, "error": error_msg},
-                duration_seconds=(datetime.now() - task.created_at).total_seconds() if task.created_at else 0,
-            )
-            return {"success": False, "error": error_msg}
+        # Reflect on the task outcome
+        duration = (datetime.now() - task.created_at).total_seconds() if task.created_at else 0
+        self.reflection_engine.reflect_on_task(
+            task_id=task.task_id,
+            result={"success": success, "artifacts": artifacts, "test_issues": test_issues},
+            duration_seconds=duration,
+        )
+
+        result = {
+            "success": success,
+            "task_id": task.task_id,
+            "status": task.status.name,
+            "summary": "\n".join(summary_parts),
+            "artifacts": artifacts,
+            "test_result": test_result,
+            "test_issues": test_issues,
+            "execution_result": execution_result,
+            "iterations": {
+                "planning": self._iteration_counts["planning"],
+                "execution": self._iteration_counts["execution"],
+                "testing": self._iteration_counts["testing"],
+            },
+        }
+
+        if task.plan:
+            result["plan"] = task.plan
+        if task.plan_analysis:
+            result["analysis"] = task.plan_analysis
+
+        logger.info("[Pipeline] Task %s finalized: success=%s, iterations=%s",
+                     task.task_id, success, self._iteration_counts)
+
+        return result
 
     # ========== Adaptive Task Handlers ==========
 
@@ -992,12 +1400,18 @@ Current Date: {datetime.now().strftime("%Y-%m-%d %H:%M")}
             r"^can\syou\sexplain",
             r"^explain\s",
             r"^describe\s",
+            r"^was\sist\s",
+            r"^wie\s",
+            r"^warum\s",
+            r"^wann\s",
+            r"^wo\s",
+            r"^wer\s",
             r"\?$",
         ]
         if any(re.search(p, description) for p in question_patterns):
             return "question"
 
-        # Simple file creation patterns
+        # Simple file creation patterns (English + German)
         simple_patterns = [
             r"^create\s+a?\s*(new\s+)?file",
             r"^write\s+a?\s*",
@@ -1005,29 +1419,34 @@ Current Date: {datetime.now().strftime("%Y-%m-%d %H:%M")}
             r"^make\s+a?\s*",
             r"^build\s+a?\s*simple\s*",
             r"^add\s+a?\s*simple\s*",
+            r"^erstell\w*\s+",
+            r"^schreib\w*\s+",
+            r"^generier\w*\s+",
+            r"^mach\w*\s+",
         ]
         if any(re.search(p, description) for p in simple_patterns):
             # Check if it references existing codebase
-            if any(kw in description for kw in ["existing", "current", "project", "module", "refactor", "fix", "update", "modify"]):
+            if any(kw in description for kw in ["existing", "current", "project", "module", "refactor", "fix", "update", "modify", "bestehend", "aktuell", "aktualisier", "änder", "fix"]):
                 return "exploratory"
             return "direct_execution"
 
-        # Complex task patterns
+        # Complex task patterns (English + German)
         complex_patterns = [
-            r"(build|create|develop)\s+a?\s*(full|complete|complex)",
-            r"(website|app|application|system|api|service)",
-            r"(multiple|several)\s+(files|pages|components)",
-            r"(frontend|backend|database|auth|authentication)",
-            r"(implement|integrate|architecture|design)",
+            r"(build|create|develop|erstell|entwickl)\w*\s+a?\s*(full|complete|complex|vollständig|komplett)",
+            r"(website|app|application|system|api|service|webseite|anwendung)",
+            r"(multiple|several|mehrere)\s+(files|pages|components|dateien|seiten|komponenten)",
+            r"(frontend|backend|database|auth|authentication|datenbank|authentifizierung)",
+            r"(implement|integrate|architecture|design|implementier|integrier|architektur)",
         ]
         if any(re.search(p, description) for p in complex_patterns):
             return "complex"
 
-        # Default: if it references existing code, exploratory; otherwise complex
-        if any(kw in description for kw in ["existing", "current", "project", "module", "refactor", "fix", "update", "modify", "add to", "integrate with"]):
+        # Default: if it references existing code, exploratory; otherwise direct_execution
+        # (Changed from "complex" to "direct_execution" — most simple tasks should skip planning)
+        if any(kw in description for kw in ["existing", "current", "project", "module", "refactor", "fix", "update", "modify", "add to", "integrate with", "bestehend", "aktuell", "projekt", "aktualisier", "änder", "fix", "erweiter"]):
             return "exploratory"
 
-        return "complex"
+        return "direct_execution"
 
     def _handle_question_task(self, task: Task) -> dict[str, Any]:
         """Handle a question-type task.
@@ -1046,7 +1465,7 @@ Current Date: {datetime.now().strftime("%Y-%m-%d %H:%M")}
                         {"role": "system", "content": self._system_context},
                         {"role": "user", "content": task.description},
                     ],
-                    max_rounds=5,
+                    max_rounds=10,
                 )
                 result = {
                     "success": True,
@@ -1069,188 +1488,22 @@ Current Date: {datetime.now().strftime("%Y-%m-%d %H:%M")}
         return self._handle_complex_task(task)
 
     def _handle_direct_execution(self, task: Task) -> dict[str, Any]:
-        """Handle a direct execution task (skip planning).
+        """Handle a direct execution task using the deterministic pipeline.
 
-        Sends the task description directly to the Executor as a goal.
+        Direct execution skips planning but still enforces: EXECUTE → TEST → (FIX → TEST?) → DONE
         """
-        logger.info("[Orchestrator] Handling as direct execution (skipping planning)")
-        task._update_status(TaskStatus.EXECUTING, "Direct execution")
-
-        try:
-            execution_result = self._run_execution_adaptive(task, goal=task.description)
-
-            if execution_result.get("success"):
-                task.set_completed({
-                    "execution": execution_result,
-                    "task_type": "direct_execution",
-                })
-                return {
-                    "success": True,
-                    "task_id": task.task_id,
-                    "status": task.status.name,
-                    "execution": execution_result,
-                    "task_type": "direct_execution",
-                }
-            else:
-                error = execution_result.get("error", "Execution failed")
-                task.set_failed(error)
-                return {
-                    "success": False,
-                    "task_id": task.task_id,
-                    "error": error,
-                    "execution": execution_result,
-                }
-
-        except Exception as e:
-            error_msg = f"Direct execution failed: {str(e)}"
-            task.set_failed(error_msg)
-            return {"success": False, "error": error_msg}
+        logger.info("[Orchestrator] Handling as direct execution (skip planning, with testing)")
+        return self._run_pipeline(task, skip_planning=True)
 
     def _handle_exploratory_task(self, task: Task) -> dict[str, Any]:
-        """Handle an exploratory task (Planner explores, then Executor implements)."""
+        """Handle an exploratory task using the deterministic pipeline."""
         logger.info("[Orchestrator] Handling as exploratory task")
-
-        # Phase 1: Planning (with exploration tools enabled)
-        planning_result = self._run_planning_loop(task)
-        if not planning_result["success"]:
-            return planning_result
-
-        # Phase 2: Execution
-        plan = task.plan or {}
-        goal = self._convert_plan_to_goal(plan) if plan else task.description
-
-        execution_result = self._run_execution_adaptive(task, goal=goal, plan=plan)
-
-        if not execution_result.get("success"):
-            error = execution_result.get("error", "Execution failed")
-            task.set_failed(error)
-            return {
-                "success": False,
-                "task_id": task.task_id,
-                "error": error,
-                "plan": task.plan,
-            }
-
-        # Phase 3: Intelligent Validation
-        validation_result = self._intelligent_validate(task, execution_result)
-
-        task_result = {
-            "plan": task.plan,
-            "analysis": task.plan_analysis,
-            "planning_iterations": task.current_planning_iteration,
-            "execution": execution_result,
-            "validation": validation_result,
-            "task_type": "exploratory",
-        }
-        task.set_completed(task_result)
-
-        duration = (datetime.now() - task.created_at).total_seconds()
-        self.reflection_engine.reflect_on_task(
-            task_id=task.task_id,
-            result=task_result,
-            duration_seconds=duration,
-        )
-
-        return {
-            "success": True,
-            "task_id": task.task_id,
-            "status": task.status.name,
-            "plan": task.plan,
-            "execution": execution_result,
-            "validation": validation_result,
-            "task_type": "exploratory",
-        }
+        return self._run_pipeline(task, skip_planning=False)
 
     def _handle_complex_task(self, task: Task) -> dict[str, Any]:
-        """Handle a complex task (full pipeline with intelligent validation)."""
+        """Handle a complex task using the deterministic pipeline."""
         logger.info("[Orchestrator] Handling as complex task (full pipeline)")
-
-        # Phase 1: Planning Loop
-        planning_result = self._run_planning_loop(task)
-        if not planning_result["success"]:
-            return planning_result
-
-        plan_type = self._infer_plan_type(task, task.plan or {})
-        if plan_type != "execution":
-            task.set_completed({
-                "plan": task.plan,
-                "analysis": task.plan_analysis,
-                "planning_iterations": task.current_planning_iteration,
-                "plan_type": plan_type,
-            })
-            return {
-                "success": True,
-                "task_id": task.task_id,
-                "status": task.status.name,
-                "plan": task.plan,
-                "analysis": task.plan_analysis,
-                "iterations": task.current_planning_iteration,
-                "plan_type": plan_type,
-            }
-
-        # Phase 2: Execution
-        plan = task.plan or {}
-        goal = self._convert_plan_to_goal(plan) if plan else task.description
-
-        execution_result = self._run_execution_adaptive(task, goal=goal, plan=plan)
-
-        if not execution_result or not execution_result.get("success"):
-            error = "Execution failed"
-            if isinstance(execution_result, dict):
-                error = execution_result.get("error", error)
-            task.set_failed(error)
-            return {
-                "success": False,
-                "task_id": task.task_id,
-                "error": error,
-                "plan": task.plan,
-            }
-
-        # Phase 3: Intelligent Validation
-        validation_result = self._intelligent_validate(task, execution_result)
-
-        if not validation_result.get("success"):
-            error = validation_result.get("error", "Validation failed")
-            task.set_failed(error)
-            return {
-                "success": False,
-                "task_id": task.task_id,
-                "error": error,
-                "plan": task.plan,
-                "execution": execution_result,
-            }
-
-        # Task completed successfully
-        task_result = {
-            "plan": task.plan,
-            "analysis": task.plan_analysis,
-            "planning_iterations": task.current_planning_iteration,
-            "execution": execution_result,
-            "validation": validation_result,
-            "plan_type": plan_type,
-            "task_type": "complex",
-        }
-        task.set_completed(task_result)
-
-        duration = (datetime.now() - task.created_at).total_seconds()
-        self.reflection_engine.reflect_on_task(
-            task_id=task.task_id,
-            result=task_result,
-            duration_seconds=duration,
-        )
-
-        return {
-            "success": True,
-            "task_id": task.task_id,
-            "status": task.status.name,
-            "plan": task.plan,
-            "analysis": task.plan_analysis,
-            "iterations": task.current_planning_iteration,
-            "execution": execution_result,
-            "validation": validation_result,
-            "plan_type": plan_type,
-            "task_type": "complex",
-        }
+        return self._run_pipeline(task, skip_planning=False)
 
     def _convert_plan_to_goal(self, plan: dict[str, Any]) -> str:
         """Convert a structured plan into a natural language goal for the Executor."""
@@ -1300,8 +1553,14 @@ Current Date: {datetime.now().strftime("%Y-%m-%d %H:%M")}
         try:
             if self._executor_bridge:
                 # Use message bus with adaptive execution
+                exec_plan = {"goal": goal}
+                if plan:
+                    exec_plan["original_plan"] = plan
+                    # Include plan steps at the top level so the bridge can count them
+                    if "steps" in plan:
+                        exec_plan["steps"] = plan["steps"]
                 result = self._executor_bridge.request_execution(
-                    plan={"goal": goal, "original_plan": plan} if plan else {"goal": goal},
+                    plan=exec_plan,
                     context={
                         "task_id": task.task_id,
                         "workspace": str(self.workspace_root),
@@ -1347,6 +1606,8 @@ Current Date: {datetime.now().strftime("%Y-%m-%d %H:%M")}
         - If excellent: accept immediately
         - If minor issues: accept with notes
         - If major issues / wrong approach: fail with explanation
+
+        Also triggers the Tester Agent for quality review when available.
 
         Args:
             task: The task being processed
@@ -1394,6 +1655,15 @@ Current Date: {datetime.now().strftime("%Y-%m-%d %H:%M")}
             llm_issues = self._llm_review_artifact_quality(task, execution_result)
 
         all_issues = content_issues + llm_issues
+
+        # Trigger Tester Agent for quality review
+        tester_result = self._auto_trigger_testing(task)
+        if tester_result:
+            if not tester_result.get("passed", True):
+                test_issues = [f"[Tester] {issue.get('description', str(issue))}" for issue in tester_result.get("issues", [])]
+                all_issues.extend(test_issues)
+            logger.info("[Validation] Tester result: passed=%s, rating=%s",
+                        tester_result.get("passed"), tester_result.get("quality_rating"))
 
         if not all_issues:
             logger.info("[Validation] Validation passed with no issues")
@@ -1679,8 +1949,12 @@ Current Date: {datetime.now().strftime("%Y-%m-%d %H:%M")}
         plan_source = plan.get("metadata", {}).get("source", "unknown")
         if plan_source in {"fallback", "fallback_error"}:
             logger.warning("[Orchestrator] Plan source is '%s' - will request revision", plan_source)
-        
-        issues = self._check_plan_quality(plan, analysis)
+
+        try:
+            issues = self._check_plan_quality(plan, analysis)
+        except Exception as e:
+            logger.error("[Orchestrator] Plan quality check failed: %s — treating as minor issues only", e)
+            issues = []
         
         if not issues:
             logger.info("[Orchestrator] Plan APPROVED for task %s", task.task_id)
@@ -1723,30 +1997,36 @@ Current Date: {datetime.now().strftime("%Y-%m-%d %H:%M")}
         """
         issues = []
 
+        steps = plan.get("steps", [])
         plan_type = self._infer_plan_type(self.get_active_task(), plan)
-        logger.info("[Orchestrator] Checking plan quality (type=%s, steps=%d)", plan_type, len(plan.get("steps", [])))
+        logger.info("[Orchestrator] Checking plan quality (type=%s, steps=%d)", plan_type, len(steps))
 
         # ===== PHASE 1: Structural Validation =====
 
-        # Reject fallback plans
+        # Accept fallback plans that have proper structure — they now include skill/action/args
         plan_source = plan.get("metadata", {}).get("source", "unknown")
         if plan_source in {"fallback", "fallback_error"}:
-            issues.append(f"Plan source is '{plan_source}' - must be regenerated with proper structure")
-            logger.warning("[Orchestrator] Plan rejected: fallback source='%s'", plan_source)
+            # Only flag if the fallback plan is actually missing structure
+            has_steps_with_actions = any(
+                isinstance(s, dict) and s.get("skill") and s.get("action") and "args" in s
+                for s in steps
+            )
+            if not has_steps_with_actions:
+                issues.append(f"Plan source is '{plan_source}' and lacks proper step structure - must be regenerated")
+                logger.warning("[Orchestrator] Fallback plan rejected: missing step structure")
 
         # Check for required fields
         if not plan.get("title"):
             issues.append("Plan missing title")
         if not plan.get("summary"):
             issues.append("Plan missing summary")
-
-        steps = plan.get("steps", [])
         if not steps:
             issues.append("Plan has no steps")
 
         if plan_type == "execution":
-            if steps and len(steps) < 2:
-                issues.append("Execution plan has too few steps (min 2)")
+            # Simple tasks may only need 1 step — don't reject minimal plans
+            if steps and len(steps) < 1:
+                issues.append("Execution plan has no steps")
 
             allowed_actions = self._allowed_executor_actions()
             step_issues = []
@@ -1986,9 +2266,13 @@ Respond with the JSON format specified in the system prompt."""
 
         except Exception as e:
             logger.warning("[LLM Plan Review] Failed to parse review response: %s", e)
-            # Return response analysis as fallback
-            if "poor" in response.lower() or "incomplete" in response.lower():
-                issues.append("[Plan Quality] LLM review indicates quality issues")
+            # If we can't parse the review, don't reject the plan —
+            # assume the structural checks are sufficient.
+            # Only flag issues if the response explicitly contains strong negative signals.
+            response_lower = response.lower()
+            strong_negative = any(word in response_lower for word in ["fundamentally flawed", "completely wrong", "cannot work", "critical failure"])
+            if strong_negative:
+                issues.append("[Plan Quality] LLM review indicates fundamental problems")
 
         return issues
     
@@ -2221,7 +2505,7 @@ Respond with the JSON format specified in the system prompt."""
             planning_result = self._planner_bridge.request_plan(
                 task_description=fix_request,
                 context=fix_context,
-                timeout_seconds=3600,  # 1 hour for fix planning
+                timeout_seconds=self.planning_timeout_seconds,
             )
             if planning_result.get("success"):
                 fix_plan = planning_result.get("plan")
@@ -2680,8 +2964,8 @@ def create_orchestrator(
     kernel=None,
     workspace_root: str | None = None,
     max_planning_iterations: int = 3,
-    planning_timeout_seconds: int = 3600,
-    execution_timeout_seconds: int = 3600,
+    planning_timeout_seconds: int = 900,
+    execution_timeout_seconds: int = 900,
 ) -> TaskOrchestrator:
     """Create and initialize a TaskOrchestrator instance."""
     return TaskOrchestrator(

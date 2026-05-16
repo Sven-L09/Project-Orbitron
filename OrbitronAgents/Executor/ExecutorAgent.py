@@ -21,30 +21,14 @@ from pathlib import Path
 from typing import Any, Optional
 
 # Import refactored skills from skills module
-try:
-    from .skills import ProgrammingSkill, WordSkill, OpenCodeSkill, ExecutorSkill
-    from .execution_state import ExecutionState, StepResult
-except ImportError:
-    import sys
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from skills import ProgrammingSkill, WordSkill, OpenCodeSkill, ExecutorSkill
-    from execution_state import ExecutionState, StepResult
+from OrbitronAgents.Executor.skills import ProgrammingSkill, WordSkill, OpenCodeSkill, ExecutorSkill
+from OrbitronAgents.Executor.execution_state import ExecutionState, StepResult
 
 # Import kernel components
-try:
-    from ...OrbitronKernel.kernel import AgentSkill
-except ImportError:
-    import sys
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from OrbitronKernel.kernel import AgentSkill
+from OrbitronKernel.kernel import AgentSkill
 
 # Import autonomous agent base
-try:
-    from ..base.autonomous_agent import AutonomousAgent, AgentLoopResult
-except ImportError:
-    import sys
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "base"))
-    from autonomous_agent import AutonomousAgent, AgentLoopResult
+from OrbitronAgents.base.autonomous_agent import AutonomousAgent, AgentLoopResult
 
 logger = logging.getLogger("ExecutorAgent")
 
@@ -92,7 +76,7 @@ class ExecutorAgent:
         agent_name: str = "executor",
         workspace_root: str | None = None,
         kernel=None,
-        max_rounds: int = 20,
+        max_rounds: int = 30,
     ):
         """Initialize the Executor Agent.
 
@@ -148,15 +132,26 @@ You have LIMITED rounds. You MUST call `submit_result` within 10-15 rounds.
 
 ## CRITICAL: Build Verification (MANDATORY)
 Before calling `submit_result`, you MUST verify that your changes compile/build correctly:
-- For Angular projects: Run `ng build` or `npx ng build` and check for compilation errors
-- For Node.js projects: Run `npm run build` or `npm start` and check for errors
-- For Python projects: Run `python -m py_compile <file>` or `pytest` to check
-- For web projects: Start the dev server (`npm start`, `ng serve`, etc.) and verify it starts
+- **BEST**: Use `verify_build` to auto-detect and run the correct build command. It returns structured results with error classification.
+- **ALTERNATIVE**: Use `run_command` with the appropriate build command (e.g., `cd project && npm run build 2>&1`).
+- ALWAYS check the `returncode` field: 0 = success, any other value = FAILURE.
+- When a command fails, read the `stderr` field for error details. The `error_summary` and `suggestion` fields provide actionable guidance.
 - If the build FAILS, you MUST fix the errors before submitting. Do NOT submit broken code.
 - If you cannot fix all errors within your remaining rounds, still call `submit_result` but note the remaining issues.
 
+## CRITICAL: Reading Command Output
+When you run `run_command` or `verify_build`, the result contains structured output:
+- `returncode`: 0 means success, any other value means failure. ALWAYS check this.
+- `stdout`: The command's standard output. May be truncated for very long outputs.
+- `stderr`: The command's error output. When returncode ≠ 0, this contains the error details.
+- `error_type`: Classification of the error (build_error, dependency_error, timeout, etc.)
+- `suggestion`: Actionable suggestion for fixing the error.
+- `error_summary`: First few lines of the error output for quick diagnosis.
+- If you see `❌ COMMAND FAILED` or `❌ BUILD FAILED`, the command did NOT succeed. Fix the errors and try again.
+- If you see `✅ COMMAND SUCCEEDED` or `✅ BUILD SUCCEEDED`, the command succeeded.
+
 ## CRITICAL: You MUST Create/Modify Files
-Your job is to IMPLEMENT changes, not just ANALYZE the codebase. You MUST use `create_file` or `update_file` at least once before calling `submit_result`. If you call `submit_result` without having created or modified any files, that is a FAILURE. Reading files and reporting "looks good" is NOT acceptable.
+Your job is to IMPLEMENT changes, not just ANALYZE the codebase. You MUST use `create_file`, `update_file`, `create_document`, or `create_report` at least once before calling `submit_result`. If you call `submit_result` without having created or modified any files, that is a FAILURE. Reading files and reporting "looks good" is NOT acceptable.
 
 ## Your Capabilities
 - Read files and directories to understand context
@@ -195,7 +190,8 @@ Your job is to IMPLEMENT changes, not just ANALYZE the codebase. You MUST use `c
   - **Append**: Provide `content` + `append=true` to add content to the end of a file (e.g., adding new CSS styles, appending functions).
   - **Full Overwrite**: Provide `content` only — replaces the ENTIRE file. Use ONLY for complete rewrites.
 - `delete_file`: Remove files when needed
-- `run_command`: Execute shell commands — USE THIS TO BUILD AND VERIFY YOUR CODE (e.g., `cd project && npm run build`, `ng build`)
+- `run_command`: Execute shell commands — USE THIS TO BUILD AND VERIFY YOUR CODE (e.g., `cd project && npm run build`, `ng build`). Always use `timeout: 120` or higher for builds.
+- `verify_build`: **PREFERRED for build verification** — Auto-detects project type and runs the correct build command. Returns structured results with error classification and suggestions. Use this instead of `run_command` for builds.
 - `check_syntax`: Validate your code before running tests
 - `run_tests`: Run tests to verify correctness
 - `web_search`: Search the web for documentation, APIs, or solutions to errors
@@ -206,10 +202,17 @@ Your job is to IMPLEMENT changes, not just ANALYZE the codebase. You MUST use `c
 - `ask_question`: **TERMINAL TOOL** — Call this if you need clarification
 
 ## CRITICAL: File Editing Rules
-- NEVER use `update_file` with just `content` on an existing file unless you intend to replace the ENTIRE file. This will DELETE all existing content.
+- ⚠️ **ALWAYS read a file BEFORE editing it.** The system will BLOCK edits to files you haven't read first. This prevents accidental overwrites.
+- NEVER use `update_file` with just `content` on an existing file unless you intend to replace the ENTIRE file. This will DELETE all existing content. The system will BLOCK overwrites that are much shorter than the existing content.
 - When adding new sections to an existing file (e.g., new CSS styles, new functions), use `append=true` mode.
 - When modifying specific parts of a file, ALWAYS use `old_content` + `new_content` (Find & Replace mode). Read the file first to get the exact text.
 - When creating a brand new file, use `create_file`.
+- **Workflow**: `read_file` → understand the code → `update_file` with `old_content`/`new_content`. NEVER skip the read step.
+
+## CRITICAL: HTML/XML Tag Consistency
+- When you change an opening HTML/XML tag (e.g., `<div>` → `<main>`), you MUST also change the corresponding closing tag (e.g., `</div>` → `</main>`).
+- The system validates HTML tag matching after every file edit. If you see `html_warnings` in the result, you MUST fix them before calling `submit_result`.
+- Common mistake: Changing `<div class="container">` to `<main class="container">` but forgetting to change the closing `</div>` to `</main>`.
 """
 
         self._autonomous_agent = AutonomousAgent(
@@ -227,6 +230,7 @@ Your job is to IMPLEMENT changes, not just ANALYZE the codebase. You MUST use `c
         self._autonomous_agent.register_syntax_tool()
         self._autonomous_agent.register_test_tool()
         self._autonomous_agent.register_git_tools()
+        self._autonomous_agent.register_verify_build_tool()
 
         # Register word document generation tools from skills
         # (Skills must be registered first via _register_default_skills,
@@ -359,7 +363,7 @@ Your job is to IMPLEMENT changes, not just ANALYZE the codebase. You MUST use `c
         for op in file_operations:
             path = op.get("path", "")
             action = op.get("action", "")
-            if path and action in ("create_file", "update_file") and path not in loop_artifacts:
+            if path and action in ("create_file", "update_file", "create_document", "create_report") and path not in loop_artifacts:
                 loop_artifacts.append(path)
                 state.record_file_created(path, op.get("size_bytes", 0))
             elif path and action == "delete_file":

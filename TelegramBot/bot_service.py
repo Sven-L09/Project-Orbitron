@@ -15,6 +15,52 @@ import requests
 from TelegramBot.telegram_client import TelegramClient
 from TelegramBot.text import split_telegram_text
 
+logger = logging.getLogger("TelegramBot")
+
+
+class ResponseSender:
+    """Helper object that bundles text and file sending for a specific Telegram chat.
+
+    Passed to message handlers so they can send both text messages and files
+    back to the user without needing direct access to the TelegramClient.
+    """
+
+    def __init__(self, telegram: TelegramClient, chat_id: int):
+        self._telegram = telegram
+        self._chat_id = chat_id
+
+    def send_text(self, msg: str) -> None:
+        """Send a text message (auto-splits long messages)."""
+        for chunk in split_telegram_text(msg):
+            self._telegram.send_message(self._chat_id, chunk)
+
+    def send_file(self, file_path: str, caption: str = "") -> None:
+        """Send a document file to the chat.
+
+        Handles errors gracefully — logs warnings and sends a text
+        fallback message instead of crashing.
+        """
+        try:
+            self._telegram.send_document(
+                chat_id=self._chat_id,
+                file_path=file_path,
+                caption=caption[:1024] if caption else "",
+            )
+            logger.info(f"[Telegram] File sent: {file_path}")
+        except FileNotFoundError:
+            logger.warning(f"[Telegram] File not found: {file_path}")
+            self.send_text(f"⚠️ Datei nicht gefunden: {Path(file_path).name}")
+        except ValueError as e:
+            logger.warning(f"[Telegram] File too large: {e}")
+            self.send_text(f"⚠️ Datei zu groß zum Senden: {Path(file_path).name}")
+        except Exception as e:
+            logger.error(f"[Telegram] Failed to send file {file_path}: {e}")
+            self.send_text(f"⚠️ Fehler beim Senden der Datei: {Path(file_path).name}")
+
+    # Allow callable usage for backward compatibility: sender("text")
+    def __call__(self, msg: str) -> None:
+        self.send_text(msg)
+
 
 @dataclass
 class TelegramBotService:
@@ -50,6 +96,10 @@ class TelegramBotService:
 
         if command == "/reset":
             self._cmd_reset(chat_id, username, send)
+            return True
+
+        if command == "/queue":
+            self._cmd_queue(chat_id, username, send)
             return True
 
         return False
@@ -116,6 +166,16 @@ class TelegramBotService:
             for name, state in comp_status.items():
                 lines.append(f"{name}: {state}")
 
+            # Task Queue info
+            if hasattr(service, '_task_queue'):
+                queue_status = service._task_queue.get_queue_status()
+                current = queue_status.get("current_task")
+                queued = queue_status.get("queued_count", 0)
+                if current:
+                    lines.append(f"Queue: Working on '{current.get('description', '?')[:40]}' ({queued} queued)")
+                else:
+                    lines.append(f"Queue: Idle ({queued} queued)")
+
             # Lifetime events
             lines.append(f"Events: {status.get('lifetime_events', 0)}")
         else:
@@ -166,6 +226,37 @@ class TelegramBotService:
 
         logger.info(f"[Telegram] Session cleared for chat_id={chat_id}")
         send("Context zurückgesetzt. Neues Gespräch gestartet.")
+
+    def _cmd_queue(self, chat_id: int, username: str, send: Callable[[str], None]) -> None:
+        """Handle /queue command — show task queue status."""
+        logger = logging.getLogger("TelegramBot")
+        logger.info(f"[Telegram] /queue command from {username}")
+
+        service = self._get_service_system()
+        if not service or not hasattr(service, '_task_queue'):
+            send("Task Queue nicht verfügbar.")
+            return
+
+        queue_status = service._task_queue.get_queue_status()
+        current = queue_status.get("current_task")
+        queued = queue_status.get("queued_count", 0)
+        queue_list = queue_status.get("queue", [])
+
+        lines = ["📋 Task Queue", "=" * 30]
+
+        if current:
+            lines.append(f"🔄 Aktuell: {current.get('description', '?')[:60]}")
+        else:
+            lines.append("⏸️ Aktuell: Leer")
+
+        if queue_list:
+            lines.append(f"\n📝 Warteschlange ({queued}):")
+            for i, task in enumerate(queue_list, 1):
+                lines.append(f"  {i}. {task.get('description', '?')[:50]} (von {task.get('username', '?')})")
+        elif queued == 0:
+            lines.append("\n📝 Warteschlange: Leer")
+
+        send("\n".join(lines))
 
     def _get_service_system(self):
         """Get the ServiceSystem instance."""
@@ -236,12 +327,10 @@ class TelegramBotService:
 
                     logger.info(f"[Telegram] Message from {username} (chat_id={chat_id}): {text[:60]}...")
 
-                    def _send(msg: str) -> None:
-                        for chunk in split_telegram_text(msg):
-                            self.telegram.send_message(chat_id, chunk)
+                    sender = ResponseSender(self.telegram, chat_id)
 
                     # Check for bot commands first
-                    if self._handle_command(text, chat_id, username, _send):
+                    if self._handle_command(text, chat_id, username, sender):
                         continue
 
                     stop_typing = self._start_typing(chat_id)
@@ -250,23 +339,38 @@ class TelegramBotService:
                         if self.message_handler:
                             logger.info(f"[Telegram] Routing to ServiceSystem handler for task processing")
                             try:
-                                answer = self.message_handler(text, chat_id, username, _send)
+                                answer = self.message_handler(text, chat_id, username, sender)
                             except TypeError:
-                                # Backwards compatibility for 3-arg handlers
-                                answer = self.message_handler(text, chat_id, username)
+                                # Backwards compatibility for 3-arg handlers (no sender)
+                                try:
+                                    answer = self.message_handler(text, chat_id, username)
+                                except TypeError:
+                                    # 2-arg handler (text, chat_id)
+                                    answer = self.message_handler(text, chat_id)
+                                # Handler didn't get sender, so we send the answer ourselves
+                                if isinstance(answer, list):
+                                    for msg in answer:
+                                        sender(msg)
+                                elif isinstance(answer, str) and answer:
+                                    sender(answer)
+                                total_len = sum(len(m) for m in answer) if isinstance(answer, list) else len(answer or "")
+                            else:
+                                # Handler received sender — it already sent via sender callback
+                                total_len = len(answer or "")
                         else:
                             # Use Orchestrator with session memory (includes personality & context)
                             answer = bridge.chat_with_session(f"[{username}] {text}", chat_id=chat_id)
+                            if isinstance(answer, list):
+                                for msg in answer:
+                                    sender(msg)
+                                total_len = sum(len(m) for m in answer)
+                            elif isinstance(answer, str) and answer:
+                                sender(answer)
+                                total_len = len(answer)
+                            else:
+                                total_len = 0
                     finally:
                         stop_typing.set()
-
-                    if isinstance(answer, list):
-                        for msg in answer:
-                            _send(msg)
-                        total_len = sum(len(m) for m in answer)
-                    else:
-                        _send(answer)
-                        total_len = len(answer)
 
                     logger.info(f"[Telegram] Response sent to {username} ({total_len} chars)")
 

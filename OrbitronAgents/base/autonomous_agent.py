@@ -66,6 +66,7 @@ class AutonomousAgent:
     # Context window management
     MAX_MESSAGES = 50
     MAX_TOOL_RESULT_CHARS = 20000
+    MAX_COMMAND_OUTPUT_CHARS = 50000  # Larger limit for command output (builds, tests)
 
     # Urgency message injected when agent is nearing max_rounds without submitting
     URGENCY_MESSAGE = (
@@ -78,8 +79,9 @@ class AutonomousAgent:
         agent_name: str,
         system_prompt: str,
         kernel=None,
-        max_rounds: int = 30,
+        max_rounds: int = 40,
         urgency_threshold: float = 0.6,
+        on_progress: Optional[Callable[[dict[str, Any]], None]] = None,
     ):
         self.agent_name = agent_name
         self.system_prompt = system_prompt
@@ -89,9 +91,12 @@ class AutonomousAgent:
         self._tools: dict[str, ToolDefinition] = {}
         self._handlers: dict[str, Callable[[dict[str, Any]], Any]] = {}
         self._logger = logging.getLogger(f"AutonomousAgent.{agent_name}")
+        self._on_progress = on_progress  # Optional progress callback
 
         # Track file operations made during the loop for artifact extraction
         self._file_operations: list[dict[str, Any]] = []
+        # Track files that have been read in this loop (read-before-write safety)
+        self._files_read: set[str] = set()
 
     # ========== Tool Management ==========
 
@@ -154,16 +159,147 @@ class AutonomousAgent:
         return tool_name in self.TERMINAL_TOOLS
 
     def _format_tool_result(self, tool_name: str, result: ToolResult) -> str:
-        """Format and truncate a tool result for inclusion in messages."""
+        """Format and truncate a tool result for inclusion in messages.
+
+        Uses a larger limit for command output (run_command, run_tests, verify_build)
+        and applies smart truncation that preserves the most important parts.
+        """
         result_dict = result.to_dict()
+
+        # Determine the character limit based on tool type
+        is_command_tool = tool_name in ("run_command", "run_tests", "verify_build",
+                                         "execute_command", "execute_python")
+        max_chars = self.MAX_COMMAND_OUTPUT_CHARS if is_command_tool else self.MAX_TOOL_RESULT_CHARS
+
+        # For command tools, restructure the output for better LLM readability
+        if is_command_tool and result.success and isinstance(result.result, dict):
+            result_dict = self._format_command_result(tool_name, result.result)
+
         result_str = json.dumps(result_dict, ensure_ascii=False)
-        if len(result_str) > self.MAX_TOOL_RESULT_CHARS:
+
+        if len(result_str) > max_chars:
             self._logger.warning(
                 "[%s] Truncating tool result for '%s' from %d to %d chars",
-                self.agent_name, tool_name, len(result_str), self.MAX_TOOL_RESULT_CHARS,
+                self.agent_name, tool_name, len(result_str), max_chars,
             )
-            result_str = result_str[:self.MAX_TOOL_RESULT_CHARS] + f"...[truncated — {len(result_str)} chars total]"
+            # Smart truncation: preserve structure and key information
+            result_str = self._smart_truncate_result(result_str, max_chars, is_command_tool)
+
         return result_str
+
+    def _format_command_result(self, tool_name: str, cmd_result: dict[str, Any]) -> dict[str, Any]:
+        """Restructure command output for maximum LLM readability.
+
+        Puts the most important information first: exit code, then errors, then output.
+        Adds clear visual markers for success/failure.
+        """
+        formatted: dict[str, Any] = {"success": True}
+
+        returncode = cmd_result.get("returncode", cmd_result.get("ok", -1))
+        if isinstance(returncode, bool):
+            returncode = 0 if returncode else 1
+
+        stdout = cmd_result.get("stdout", "")
+        stderr = cmd_result.get("stderr", "")
+        ok = cmd_result.get("ok", True)
+
+        # Determine success/failure
+        if returncode != 0 or not ok:
+            formatted["success"] = False
+            formatted["❌ COMMAND FAILED"] = f"exit code {returncode}"
+            # Put stderr FIRST when there's an error — it's more important
+            if stderr:
+                formatted["stderr"] = stderr
+            if stdout:
+                formatted["stdout"] = stdout
+            # Add error classification
+            error_type = self._classify_command_error(stderr or stdout or "", returncode)
+            if error_type:
+                formatted["error_type"] = error_type
+            # Add actionable suggestion
+            suggestion = self._suggest_fix(stderr or stdout or "", returncode)
+            if suggestion:
+                formatted["suggestion"] = suggestion
+        else:
+            formatted["✅ COMMAND SUCCEEDED"] = f"exit code {returncode}"
+            if stdout:
+                formatted["stdout"] = stdout
+            if stderr:
+                formatted["stderr"] = stderr
+
+        # Preserve any additional fields from the original result
+        for key in ("ok", "action", "path", "matches", "count", "items", "valid",
+                     "error_type", "error_summary"):
+            if key in cmd_result and key not in formatted:
+                formatted[key] = cmd_result[key]
+
+        return formatted
+
+    def _classify_command_error(self, output: str, returncode: int) -> str:
+        """Classify the type of command error from output and return code."""
+        output_lower = output.lower()
+        if "command not found" in output_lower or "is not recognized" in output_lower:
+            return "command_not_found"
+        if "permission denied" in output_lower or "eacces" in output_lower:
+            return "permission_denied"
+        if "timed out" in output_lower or "timeout" in output_lower:
+            return "timeout"
+        if any(word in output_lower for word in ("compilation error", "syntaxerror", "syntax error",
+                                                    "build failed", "compilation failed")):
+            return "build_error"
+        if any(word in output_lower for word in ("test failed", "test failure", "assertionerror",
+                                                    "assertion error", "tests failed")):
+            return "test_failure"
+        if any(word in output_lower for word in ("module not found", "importerror",
+                                                    "no module named", "cannot find module")):
+            return "dependency_error"
+        if any(word in output_lower for word in ("runtime error", "exception", "traceback")):
+            return "runtime_error"
+        return "unknown_error" if returncode != 0 else ""
+
+    def _suggest_fix(self, output: str, returncode: int) -> str:
+        """Suggest a fix based on the error output."""
+        output_lower = output.lower()
+        if "command not found" in output_lower or "is not recognized" in output_lower:
+            return "The command was not found. Check that the required tool is installed and in your PATH."
+        if "permission denied" in output_lower:
+            return "Permission denied. Try running with appropriate permissions or check file ownership."
+        if "eacces" in output_lower or "access denied" in output_lower:
+            return "Access denied. Check file/directory permissions."
+        if "module not found" in output_lower or "no module named" in output_lower:
+            return "A dependency is missing. Try running 'npm install' or 'pip install' first."
+        if "cannot find module" in output_lower:
+            return "A Node.js module is missing. Try running 'npm install' first."
+        if "port" in output_lower and ("in use" in output_lower or "already" in output_lower):
+            return "A port is already in use. Try a different port or kill the existing process."
+        if returncode == 1:
+            return "The command exited with an error. Check the stderr output above for details."
+        if returncode == 2:
+            return "The command exited with a usage error. Check the command syntax and arguments."
+        return ""
+
+    def _smart_truncate_result(self, result_str: str, max_chars: int, is_command: bool) -> str:
+        """Smart truncation that preserves the most important parts of a result.
+
+        For command results: keeps first and last portions, preserving exit code info.
+        For other results: keeps the beginning and adds a truncation notice.
+        """
+        if len(result_str) <= max_chars:
+            return result_str
+
+        if is_command:
+            # For command output, try to keep the beginning (exit code, first errors)
+            # and the end (final summary, last errors)
+            head_size = int(max_chars * 0.6)
+            tail_size = int(max_chars * 0.35)
+            head = result_str[:head_size]
+            tail = result_str[-tail_size:]
+            omitted = len(result_str) - head_size - tail_size
+            return f"{head}\n...[{omitted} chars omitted — {len(result_str)} chars total]...\n{tail}"
+        else:
+            # For other results, keep the beginning and truncate
+            head = result_str[:max_chars - 100]
+            return f"{head}...[truncated — {len(result_str)} chars total]"
 
     def _trim_messages(self, messages: list[dict[str, Any]]) -> None:
         """Trim message history when it grows too large.
@@ -234,6 +370,7 @@ class AutonomousAgent:
 
         # Reset file operation tracking
         self._file_operations = []
+        self._files_read = set()
 
         # Build initial messages
         user_content = task_description
@@ -328,16 +465,51 @@ class AutonomousAgent:
                         result_str = self._format_tool_result(name, result)
                         messages.append({"role": "tool", "tool_name": name, "content": result_str})
 
+                        # Track files that have been read (read-before-write safety)
+                        if name == "read_file" and result.success:
+                            file_path = args.get("path", "")
+                            if file_path:
+                                self._files_read.add(file_path)
+
+                        # Progress callback
+                        if self._on_progress:
+                            self._on_progress({
+                                "round": round_num + 1,
+                                "tool": name,
+                                "success": result.success,
+                                "result_summary": result_str[:200] if result_str else "",
+                            })
+
             # Execute write tools sequentially
             for name, args, _ in write_calls:
                 total_tool_calls += 1
+
+                # Read-before-write safety: enforce reading before editing
+                if name == "update_file":
+                    file_path = args.get("path", "")
+                    if file_path and file_path not in self._files_read:
+                        self._logger.warning(
+                            "[%s] ⚠️ update_file called on '%s' without reading it first! "
+                            "Blocking the edit — read the file first to avoid unintended overwrites.",
+                            self.agent_name, file_path,
+                        )
+                        # Return an error instead of proceeding with the edit
+                        result_str = json.dumps({
+                            "ok": False,
+                            "error": f"Cannot update '{file_path}': you must read this file first with read_file before editing it. "
+                                     f"This prevents accidental overwrites. Call read_file on this file first, then retry the update.",
+                            "path": file_path,
+                        })
+                        messages.append({"role": "tool", "tool_name": name, "content": result_str})
+                        continue
+
                 self._logger.info("[%s] Tool call: %s(args=%s)", self.agent_name, name, args)
                 result = self.execute_tool(name, args)
                 result_dict = result.to_dict()
                 result_str = self._format_tool_result(name, result)
 
                 # Track file operations for artifact extraction
-                if name in ("create_file", "update_file", "delete_file"):
+                if name in ("create_file", "update_file", "delete_file", "create_document", "create_report"):
                     file_path = args.get("path", args.get("filename", ""))
                     if file_path:
                         self._file_operations.append({
@@ -352,6 +524,15 @@ class AutonomousAgent:
 
                 if self._is_terminal_tool(name):
                     self._logger.info("[%s] Terminal tool '%s' called after %d rounds", self.agent_name, name, round_num + 1)
+                    # Progress callback for terminal tool
+                    if self._on_progress:
+                        self._on_progress({
+                            "round": round_num + 1,
+                            "tool": name,
+                            "success": result.success,
+                            "terminal": True,
+                            "result_summary": result_str[:200] if result_str else "",
+                        })
                     return AgentLoopResult(
                         content=result_str,
                         done=True,
@@ -363,6 +544,15 @@ class AutonomousAgent:
                     )
 
                 messages.append({"role": "tool", "tool_name": name, "content": result_str})
+
+                # Progress callback for write tools
+                if self._on_progress:
+                    self._on_progress({
+                        "round": round_num + 1,
+                        "tool": name,
+                        "success": result.success,
+                        "result_summary": result_str[:200] if result_str else "",
+                    })
 
             # Inject urgency message once when nearing max rounds without submitting
             urgency_round = int(max_rounds * self.urgency_threshold)
@@ -432,7 +622,7 @@ class AutonomousAgent:
         )
         self.register_tool(
             name="update_file",
-            description="Edit an existing file. Three modes: (1) Find & Replace: provide 'old_content' and 'new_content' to surgically replace a specific section — always read the file first to get exact text. (2) Append: provide 'content' with 'append=true' to add content to the end of a file. (3) Full Overwrite: provide 'content' only — replaces the ENTIRE file. Use ONLY for complete rewrites. IMPORTANT: For editing existing files, prefer Find & Replace or Append to avoid accidentally deleting existing content.",
+            description="Edit an existing file. Three modes: (1) Find & Replace: provide 'old_content' and 'new_content' to surgically replace a specific section — ALWAYS read the file first to get exact text. (2) Append: provide 'content' with 'append=true' to add content to the end of a file. (3) Full Overwrite: provide 'content' only — replaces the ENTIRE file. Use ONLY for complete rewrites. ⚠️ WARNING: You MUST call read_file on a file BEFORE editing it with update_file. Editing a file you haven't read risks destroying existing content. The system tracks which files you've read and will warn you if you try to edit an unread file.",
             schema={
                 "type": "object",
                 "required": ["path"],
@@ -473,11 +663,22 @@ class AutonomousAgent:
         )
 
     def _kernel_file_tool(self, tool_name: str, args: dict[str, Any]) -> Any:
-        """Delegate a file tool call to the kernel."""
+        """Delegate a file tool call to the kernel.
+
+        The kernel's _dispatch_tool returns a JSON string. We parse it once
+        and return the dict directly so that _format_tool_result can properly
+        format it for the LLM. This avoids double-encoding.
+        """
         result_str = self.kernel._dispatch_tool(tool_name, args)
         try:
-            return json.loads(result_str)
+            parsed = json.loads(result_str)
+            # Return the parsed dict directly — it will be wrapped in ToolResult
+            # by execute_tool, then properly formatted by _format_tool_result.
+            # No double-encoding: the dict flows through naturally.
+            return parsed
         except json.JSONDecodeError:
+            # If the kernel returned non-JSON (shouldn't happen normally),
+            # wrap it in a simple dict
             return {"ok": True, "raw": result_str}
 
     def register_search_tool(self) -> None:
@@ -505,13 +706,19 @@ class AutonomousAgent:
             return
         self.register_tool(
             name="run_command",
-            description="Run a shell command in the workspace. Be careful with destructive operations.",
+            description=(
+                "Run a shell command in the workspace. Use this to build projects, run tests, "
+                "install dependencies, or execute any shell command. IMPORTANT: Always check the "
+                "returncode field in the result — 0 means success, any other value means failure. "
+                "When a command fails, read the stderr field for error details. "
+                "For build commands (npm run build, ng build, etc.), use timeout=120 or higher."
+            ),
             schema={
                 "type": "object",
                 "required": ["command"],
                 "properties": {
                     "command": {"type": "string", "description": "Shell command to execute"},
-                    "timeout": {"type": "integer", "description": "Timeout in seconds", "default": 30},
+                    "timeout": {"type": "integer", "description": "Timeout in seconds (use 120+ for builds)", "default": 120},
                     "cwd": {"type": "string", "description": "Working directory (relative to workspace)", "default": "."},
                 },
             },
@@ -580,4 +787,32 @@ class AutonomousAgent:
                 },
             },
             handler=lambda args: self._kernel_file_tool("git_diff", args),
+        )
+
+    def register_verify_build_tool(self) -> None:
+        """Register the verify_build tool from the kernel.
+
+        This tool auto-detects the project type and runs the appropriate
+        build command, returning structured results with error classification.
+        """
+        if not self.kernel:
+            return
+        self.register_tool(
+            name="verify_build",
+            description=(
+                "Detect the project type and run the appropriate build command. "
+                "Automatically detects Angular, React, Vue, Next.js, Vite, Node.js, Python, "
+                "and other project types. Returns structured results with success/failure, "
+                "error details, error type classification, and fix suggestions. "
+                "IMPORTANT: Always call this BEFORE submitting your result to verify the build succeeds."
+            ),
+            schema={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Relative path to the project root (default: '.')", "default": "."},
+                    "build_command": {"type": "string", "description": "Optional override build command (e.g., 'npm run build:prod'). If not provided, auto-detected from project config."},
+                    "timeout": {"type": "integer", "description": "Timeout in seconds for the build (default: 180)", "default": 180},
+                },
+            },
+            handler=lambda args: self._kernel_file_tool("verify_build", args),
         )

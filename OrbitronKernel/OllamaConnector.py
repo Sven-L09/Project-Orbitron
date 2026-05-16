@@ -15,7 +15,7 @@ logger = logging.getLogger("OllamaConnector")
 class OllamaConnector:
     API_BASE_URL_DEFAULT = "https://ollama.com/api"
     API_KEY_DEFAULT = ""
-    MODEL_DEFAULT = "qwen3.5:cloud"
+    MODEL_DEFAULT = "glm-5.1:cloud"
 
     def __init__(
         self,

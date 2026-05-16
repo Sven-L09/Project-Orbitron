@@ -33,7 +33,7 @@ class Config:
         return {
             "ollama": {
                 "base_url": "https://ollama.com/api",
-                "model": "qwen3.5:cloud",
+                "model": "glm-5.1:cloud",
                 "api_key": ""
             },
             "kernel": {

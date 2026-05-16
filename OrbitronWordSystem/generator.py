@@ -25,7 +25,31 @@ class PandocGenerator:
     """
 
     def __init__(self, reference_doc_path: str | None = None) -> None:
+        self._ensure_pandoc()
         self.reference_doc_path = self._resolve_reference_doc(reference_doc_path)
+
+    # ------------------------------------------------------------------
+    # Pandoc availability
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _ensure_pandoc() -> None:
+        """Make sure the Pandoc binary is available.
+
+        If Pandoc is not found on the system, this automatically downloads
+        it via ``pypandoc.download_pandoc()`` so that document generation
+        works without requiring a system-level installation.
+        """
+        try:
+            import pypandoc
+            pypandoc.get_pandoc_path()  # raises OSError if not found
+        except OSError:
+            logger.info("[PandocGenerator] Pandoc binary not found – downloading via pypandoc…")
+            try:
+                pypandoc.download_pandoc()
+                logger.info("[PandocGenerator] Pandoc downloaded successfully")
+            except Exception as exc:
+                logger.warning("[PandocGenerator] Failed to download Pandoc: %s", exc)
 
     # ------------------------------------------------------------------
     # Public API
@@ -158,6 +182,9 @@ class PandocGenerator:
     def check_pandoc_available(self) -> tuple[bool, str]:
         """Check whether Pandoc is installed and accessible.
 
+        If Pandoc is not found, attempts to download it automatically via
+        ``pypandoc.download_pandoc()`` before reporting failure.
+
         Returns:
             (available, message) tuple.
         """
@@ -168,8 +195,17 @@ class PandocGenerator:
             return True, f"Pandoc {version} at {path}"
         except ImportError:
             return False, "pypandoc is not installed"
-        except OSError as exc:
-            return False, f"Pandoc binary not found: {exc}"
+        except OSError:
+            # Try auto-downloading Pandoc
+            try:
+                import pypandoc  # noqa: F811
+                logger.info("[PandocGenerator] Pandoc binary not found – attempting auto-download…")
+                pypandoc.download_pandoc()
+                path = pypandoc.get_pandoc_path()
+                version = pypandoc.get_pandoc_version()
+                return True, f"Pandoc {version} at {path} (auto-installed)"
+            except Exception as exc:
+                return False, f"Pandoc binary not found and auto-download failed: {exc}"
 
     # ------------------------------------------------------------------
     # Internal helpers

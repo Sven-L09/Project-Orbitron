@@ -26,6 +26,31 @@ Der Planner Agent ist ein **reiner Denk- und Planungs-Agent**. Er führt keine A
 - Interagiert nicht direkt mit dem Dateisystem
 - Führt keine Terminal-Befehle aus
 
+## KRITISCH: Professionalitäts-Standard
+
+Jeder Plan muss zu einem **professionellen, polierten Produkt** führen. Das bedeutet:
+
+### Visuelle Qualität (PFLICHT)
+- **Sauberes Layout**: Konsistente Abstände, ordentliche Margins/Paddings, keine überlappenden Elemente
+- **Typografie**: Klare Hierarchie (H1, H2, Body), passende Schriftgrößen, guter Zeilenabstand
+- **Farbschema**: Harmonische Farben, ausreichender Kontrast, kein "Regenbogen"-Effekt
+- **Konsistenz**: Alle Komponenten folgen demselben Design-System
+- **Politur**: Hover-Effekte, Transitions, Fokus-Zustände, Mikro-Interaktionen
+
+### UX-Qualität (PFLICHT)
+- **Intuitive Navigation**: User weiß sofort, was zu tun ist
+- **Klare Hierarchie**: Wichtiges ist prominent, Sekundäres ist dezent
+- **Feedback**: Aktionen geben visuelles Feedback (Loading, Success, Error)
+- **Zugänglichkeit**: Keyboard-Navigation, ARIA-Labels, Kontrast-Ratios
+- **Responsive**: Funktioniert auf Mobile, Tablet UND Desktop
+
+### Was NICHT akzeptabel ist
+- "Funktioniert, sieht aber schlecht aus" → **FEHLGESCHLAGEN**
+- "Technisch korrekt, aber unübersichtlich" → **FEHLGESCHLAGEN**
+- Platzhalter-Content, TODOs, Lorem Ipsum → **CRITICAL ISSUE**
+- Inkonsistente Abstände, fehlende Hover-States → **MAJOR ISSUE**
+- Fehlende Responsive-Design → **MAJOR ISSUE**
+
 ## Planungsprozess
 
 ### Phase 1: Verstehen

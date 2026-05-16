@@ -5,6 +5,13 @@ __pycache__/
 # Local runtime data
 .orbitron/
 
+# Virtual environment
+.venv/
+venv/
+
+# Binary packages
+*.deb
+
 # IDE settings
 .vscode/
 .claude/

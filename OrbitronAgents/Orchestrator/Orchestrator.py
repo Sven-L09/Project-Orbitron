@@ -20,44 +20,22 @@ from typing import Any, Optional
 logger = logging.getLogger("Orchestrator")
 
 # Import message system
-try:
-    from OrbitronMessageSystem import (
-        OrchestratorCommunicator,
-        Message,
-        MessagePriority,
-        AgentRole,
-        get_message_bus,
-    )
-    from OrbitronMessageSystem.orchestrator_planner_bridge import OrchestratorPlannerBridge
-    from OrbitronMessageSystem.orchestrator_executor_bridge import OrchestratorExecutorBridge
-    from OrbitronMessageSystem.orchestrator_tester_bridge import OrchestratorTesterBridge
-except ImportError:
-    import sys
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from OrbitronMessageSystem import (
-        OrchestratorCommunicator,
-        Message,
-        MessagePriority,
-        AgentRole,
-        get_message_bus,
-    )
-    from OrbitronMessageSystem.orchestrator_planner_bridge import OrchestratorPlannerBridge
-    from OrbitronMessageSystem.orchestrator_executor_bridge import OrchestratorExecutorBridge
-    from OrbitronMessageSystem.orchestrator_tester_bridge import OrchestratorTesterBridge
+from OrbitronMessageSystem import (
+    OrchestratorCommunicator,
+    Message,
+    MessagePriority,
+    AgentRole,
+    get_message_bus,
+)
+from OrbitronMessageSystem.orchestrator_planner_bridge import OrchestratorPlannerBridge
+from OrbitronMessageSystem.orchestrator_executor_bridge import OrchestratorExecutorBridge
+from OrbitronMessageSystem.orchestrator_tester_bridge import OrchestratorTesterBridge
 
 # Import reflection engine
-try:
-    from .reflection_engine import ReflectionEngine
-except ImportError:
-    from reflection_engine import ReflectionEngine
+from OrbitronAgents.Orchestrator.reflection_engine import ReflectionEngine
 
 # Import autonomous agent base
-try:
-    from ..base.autonomous_agent import AutonomousAgent, AgentLoopResult
-except ImportError:
-    import sys
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "base"))
-    from autonomous_agent import AutonomousAgent, AgentLoopResult
+from OrbitronAgents.base.autonomous_agent import AutonomousAgent, AgentLoopResult
 
 
 class ContextLoader:
@@ -485,9 +463,9 @@ class TaskOrchestrator:
             "execution": 0,
             "testing": 0,
         }
-        self._max_planning_calls: int = 1
-        self._max_execution_calls: int = 2
-        self._max_testing_calls: int = 2
+        self._max_planning_calls: int = 2
+        self._max_execution_calls: int = 3
+        self._max_testing_calls: int = 3
         if self.kernel:
             self._setup_decision_agent()
 
@@ -544,7 +522,7 @@ For **implementation tasks** (files, code, documents):
             agent_name="orchestrator_decision",
             system_prompt=system_prompt,
             kernel=self.kernel,
-            max_rounds=15,
+            max_rounds=22,
             urgency_threshold=0.4,
         )
 
@@ -634,7 +612,7 @@ For **implementation tasks** (files, code, documents):
                 {"role": "system", "content": self._system_context},
                 {"role": "user", "content": f"{query}\n\nContext: {context}" if context else query},
             ]
-            response = self.kernel.run_chat(messages=messages, max_rounds=10)
+            response = self.kernel.run_chat(messages=messages, max_rounds=15)
             return {"ok": True, "answer": response}
         except Exception as e:
             return {"ok": False, "error": str(e)}
@@ -1146,18 +1124,20 @@ Current Date: {datetime.now().strftime("%Y-%m-%d %H:%M")}
         # ===== PHASE 3: Testing (mandatory) =====
         test_result = self._run_testing_phase(task, execution_result)
 
-        if test_result and not test_result.get("passed", False):
-            # ===== PHASE 4: Fix cycle (one attempt only) =====
-            if self._iteration_counts["execution"] < self._max_execution_calls:
-                logger.info("[Pipeline] Test found issues, attempting fix cycle")
-                fix_goal = self._build_fix_goal(task, execution_result, test_result)
-                execution_result = self._run_execution_adaptive(task, goal=fix_goal)
-                self._iteration_counts["execution"] += 1
-                self._last_execution_result = execution_result
+        # ===== PHASE 4: Fix cycle (up to max_execution_calls remaining) =====
+        while (test_result and not test_result.get("passed", False)
+               and self._iteration_counts["execution"] < self._max_execution_calls
+               and self._iteration_counts["testing"] < self._max_testing_calls):
+            logger.info("[Pipeline] Test found issues, attempting fix cycle (execution=%d/%d, testing=%d/%d)",
+                        self._iteration_counts["execution"], self._max_execution_calls,
+                        self._iteration_counts["testing"], self._max_testing_calls)
+            fix_goal = self._build_fix_goal(task, execution_result, test_result)
+            execution_result = self._run_execution_adaptive(task, goal=fix_goal)
+            self._iteration_counts["execution"] += 1
+            self._last_execution_result = execution_result
 
-                # ===== PHASE 5: Re-test after fix =====
-                if self._iteration_counts["testing"] < self._max_testing_calls:
-                    test_result = self._run_testing_phase(task, execution_result)
+            # Re-test after fix
+            test_result = self._run_testing_phase(task, execution_result)
 
         # ===== PHASE 6: Finalize (always) =====
         return self._finalize_task(task, execution_result, test_result)
@@ -1316,7 +1296,20 @@ Current Date: {datetime.now().strftime("%Y-%m-%d %H:%M")}
             if test_summary:
                 summary_parts.append(f"Test summary: {test_summary[:300]}")
 
-            if test_passed and quality in ("excellent", "good"):
+            # Count major/critical issues — these override the test_passed flag
+            major_or_critical = [
+                i for i in test_issues
+                if isinstance(i, dict) and i.get("severity") in ("major", "critical")
+            ]
+
+            if major_or_critical:
+                # Major/critical issues found — always mark as failed
+                success = False
+                logger.warning(
+                    "[Pipeline] %d major/critical issue(s) found — marking task as failed (quality=%s)",
+                    len(major_or_critical), quality,
+                )
+            elif test_passed and quality in ("excellent", "good"):
                 success = True
             elif test_passed:
                 success = True  # Acceptable quality
@@ -1411,6 +1404,21 @@ Current Date: {datetime.now().strftime("%Y-%m-%d %H:%M")}
         if any(re.search(p, description) for p in question_patterns):
             return "question"
 
+        # Complex task patterns (English + German) — checked BEFORE simple patterns
+        # Multi-step tasks that need planning should not be classified as "simple"
+        complex_indicators = [
+            r"(build|create|develop|erstell|entwickl)\w*\s+a?\s*(full|complete|complex|vollständig|komplett)",
+            r"(website|app|application|system|api|service|webseite|anwendung)",
+            r"(multiple|several|mehrere)\s+(files|pages|components|dateien|seiten|komponenten)",
+            r"(frontend|backend|database|auth|authentication|datenbank|authentifizierung)",
+            r"(implement|integrate|architecture|design|implementier|integrier|architektur)",
+            r"(ordner|folder|directory|verzeichnis)\s+.*(und|and|mit|with|darin|darinnen)",  # "create folder with X inside"
+            r"(welcome\s*page|landing\s*page|homepage|startseite)",  # multi-file deliverables
+            r"\bund\b.*\b(darin|dorthin|inside|in\s+(?:the|dem|der))\b",  # "X and Y in it"
+        ]
+        if any(re.search(p, description) for p in complex_indicators):
+            return "complex"
+
         # Simple file creation patterns (English + German)
         simple_patterns = [
             r"^create\s+a?\s*(new\s+)?file",
@@ -1430,23 +1438,12 @@ Current Date: {datetime.now().strftime("%Y-%m-%d %H:%M")}
                 return "exploratory"
             return "direct_execution"
 
-        # Complex task patterns (English + German)
-        complex_patterns = [
-            r"(build|create|develop|erstell|entwickl)\w*\s+a?\s*(full|complete|complex|vollständig|komplett)",
-            r"(website|app|application|system|api|service|webseite|anwendung)",
-            r"(multiple|several|mehrere)\s+(files|pages|components|dateien|seiten|komponenten)",
-            r"(frontend|backend|database|auth|authentication|datenbank|authentifizierung)",
-            r"(implement|integrate|architecture|design|implementier|integrier|architektur)",
-        ]
-        if any(re.search(p, description) for p in complex_patterns):
-            return "complex"
-
-        # Default: if it references existing code, exploratory; otherwise direct_execution
-        # (Changed from "complex" to "direct_execution" — most simple tasks should skip planning)
+        # Default: if it references existing code, exploratory; otherwise complex
         if any(kw in description for kw in ["existing", "current", "project", "module", "refactor", "fix", "update", "modify", "add to", "integrate with", "bestehend", "aktuell", "projekt", "aktualisier", "änder", "fix", "erweiter"]):
             return "exploratory"
 
-        return "direct_execution"
+        # Anything else that didn't match simple patterns is likely complex enough to plan
+        return "complex"
 
     def _handle_question_task(self, task: Task) -> dict[str, Any]:
         """Handle a question-type task.
@@ -1465,7 +1462,7 @@ Current Date: {datetime.now().strftime("%Y-%m-%d %H:%M")}
                         {"role": "system", "content": self._system_context},
                         {"role": "user", "content": task.description},
                     ],
-                    max_rounds=10,
+                    max_rounds=15,
                 )
                 result = {
                     "success": True,
@@ -1883,6 +1880,7 @@ Current Date: {datetime.now().strftime("%Y-%m-%d %H:%M")}
             if result["success"]:
                 plan = result.get("plan", {})
                 analysis = result.get("analysis", {})
+                self._iteration_counts["planning"] += 1
                 logger.info("[Orchestrator] Planning response received - plan_id=%s title='%s' steps=%d",
                              plan.get("id", "unknown"), plan.get("title", "N/A")[:50], 
                              len(plan.get("steps", [])))

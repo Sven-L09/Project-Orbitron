@@ -1,26 +1,12 @@
 """Kernel Bridge - Connects Orchestrator with OrbitronKernel."""
 
 import logging
-import sys
-from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger("KernelBridge")
 
-# Add kernel to path
-kernel_path = Path(__file__).resolve().parents[2] / "OrbitronKernel"
-if str(kernel_path) not in sys.path:
-    sys.path.insert(0, str(kernel_path))
-
-try:
-    from kernel import OrbitronKernel
-except ImportError:
-    from OrbitronKernel.kernel import OrbitronKernel
-
-try:
-    from .Orchestrator import Orchestrator
-except ImportError:
-    from Orchestrator import Orchestrator
+from OrbitronKernel.kernel import OrbitronKernel
+from OrbitronAgents.Orchestrator.Orchestrator import Orchestrator
 
 
 class KernelBridge:

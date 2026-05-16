@@ -6,19 +6,20 @@ import logging
 import os
 import re
 import subprocess
+from collections import Counter
 from pathlib import Path
 from typing import Any, Optional
 
 logger = logging.getLogger("SkillRegistry")
 
 try:
-    # Package import (recommended): python -m OrbitronKernel.main / OrbitronSystem/main.py
+    # Package import (recommended): python -m OrbitronSystem.main
     from .OllamaConnector import OllamaConnector
     from .config import Config
     from .file_operations import FileOperations
     from .timeout_manager import TimeoutManager
 except ImportError:
-    # Script import fallback (legacy): run from within OrbitronKernel directory
+    # Direct import fallback
     from OllamaConnector import OllamaConnector
     from config import Config
     from file_operations import FileOperations
@@ -364,7 +365,7 @@ class OrbitronKernel:
                 "type": "function",
                 "function": {
                     "name": "update_file",
-                    "description": "Edit an existing file. Three modes: (1) Find & Replace: provide 'old_content' and 'new_content' to surgically replace a specific section — always read the file first to get exact text. (2) Append: provide 'content' with 'append=true' to add content to the end of a file. (3) Full Overwrite: provide 'content' only — replaces the ENTIRE file. Use ONLY for complete rewrites. IMPORTANT: For editing existing files, prefer Find & Replace or Append to avoid accidentally deleting existing content.",
+                    "description": "Edit an existing file. Three modes: (1) Find & Replace: provide 'old_content' and 'new_content' to surgically replace a specific section — ALWAYS read the file first to get exact text. (2) Append: provide 'content' with 'append=true' to add content to the end of a file. (3) Full Overwrite: provide 'content' only — replaces the ENTIRE file. Use ONLY for complete rewrites. ⚠️ WARNING: You MUST call read_file on a file BEFORE editing it with update_file. Editing a file you haven't read risks destroying existing content.",
                     "parameters": {
                         "type": "object",
                         "required": ["path"],
@@ -441,13 +442,13 @@ class OrbitronKernel:
                 "type": "function",
                 "function": {
                     "name": "run_command",
-                    "description": "Run a shell command in the workspace. Use with caution.",
+                    "description": "Run a shell command in the workspace. Returns structured output with returncode, stdout, stderr, and error classification. IMPORTANT: Check returncode — 0 means success, any other value means failure. When a command fails, read stderr for error details. For build commands (npm run build, ng build, etc.), use timeout=120 or higher.",
                     "parameters": {
                         "type": "object",
                         "required": ["command"],
                         "properties": {
                             "command": {"type": "string", "description": "Shell command to execute"},
-                            "timeout": {"type": "integer", "description": "Timeout in seconds", "default": 30},
+                            "timeout": {"type": "integer", "description": "Timeout in seconds (use 120+ for builds)", "default": 120},
                             "cwd": {"type": "string", "description": "Working directory (relative to workspace)", "default": "."},
                         },
                     },
@@ -535,6 +536,21 @@ class OrbitronKernel:
                         "required": ["url"],
                         "properties": {
                             "url": {"type": "string", "description": "The URL of the web page to fetch"},
+                        },
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "verify_build",
+                    "description": "Detect the project type and run the appropriate build command. Returns structured results with success/failure, error details, and suggestions. Automatically detects Angular, React, Vue, Node.js, Python, and other project types.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string", "description": "Relative path to the project root (default: '.')", "default": "."},
+                            "build_command": {"type": "string", "description": "Optional override build command (e.g., 'npm run build:prod'). If not provided, auto-detected from project config."},
+                            "timeout": {"type": "integer", "description": "Timeout in seconds for the build (default: 180)", "default": 180},
                         },
                     },
                 },
@@ -633,6 +649,8 @@ class OrbitronKernel:
                 return self._tool_web_search(tool_args)
             if tool_name == "web_fetch":
                 return self._tool_web_fetch(tool_args)
+            if tool_name == "verify_build":
+                return self._tool_verify_build(tool_args)
             return json.dumps({"ok": False, "error": f"Unknown tool: {tool_name}"})
         except Exception as e:
             return json.dumps({"ok": False, "error": str(e)})
@@ -656,7 +674,77 @@ class OrbitronKernel:
         if self.file_ops.file_exists(path) and not overwrite:
             return json.dumps({"ok": False, "error": "File already exists", "path": path})
         self.file_ops.write_file(path, content)
-        return json.dumps({"ok": True, "action": "create_file", "path": path})
+
+        # Post-write validation for HTML files
+        html_warnings = []
+        if path.lower().endswith(('.html', '.htm', '.xhtml')):
+            html_warnings = self._validate_html_tags(content)
+            if html_warnings:
+                logger.warning("[Kernel] HTML validation warnings for %s: %s", path, html_warnings)
+
+        result = {"ok": True, "action": "create_file", "path": path}
+        if html_warnings:
+            result["html_warnings"] = html_warnings
+            result["hint"] = (
+                "⚠️ HTML tag mismatch detected! When changing an opening tag (e.g., <div> → <main>), "
+                "you MUST also change the corresponding closing tag (e.g., </div> → </main>). "
+                "Fix these issues before submitting."
+            )
+        return json.dumps(result)
+
+    @staticmethod
+    def _validate_html_tags(content: str) -> list[str]:
+        """Validate HTML tag matching and return a list of warnings.
+
+        Checks for mismatched opening/closing tags (e.g., <main> opened but </div> closed).
+        Self-closing tags and void elements are ignored.
+        """
+        warnings = []
+
+        # Void elements that don't need closing tags
+        void_elements = {
+            "area", "base", "br", "col", "embed", "hr", "img", "input",
+            "link", "meta", "param", "source", "track", "wbr",
+        }
+
+        # Extract all tags from content
+        tag_pattern = re.compile(r'<(/?)(\w+)[\s>]', re.IGNORECASE)
+        stack = []  # Stack of (tag_name, line_number)
+
+        for line_num, line in enumerate(content.split('\n'), 1):
+            for match in tag_pattern.finditer(line):
+                is_closing = match.group(1) == '/'
+                tag_name = match.group(2).lower()
+
+                if tag_name in void_elements:
+                    continue
+
+                if not is_closing:
+                    stack.append((tag_name, line_num))
+                else:
+                    # Closing tag — try to match with stack
+                    if stack and stack[-1][0] == tag_name:
+                        stack.pop()
+                    elif stack:
+                        # Mismatch: closing tag doesn't match opening tag
+                        opening_tag, opening_line = stack[-1]
+                        warnings.append(
+                            f"HTML tag mismatch at line {line_num}: closing </{tag_name}> "
+                            f"doesn't match opening <{opening_tag}> at line {opening_line}. "
+                            f"Did you mean </{opening_tag}>?"
+                        )
+                        stack.pop()
+                    # else: closing tag with no matching opening — less critical
+
+        # Check for unclosed tags
+        for tag_name, line_num in stack:
+            if tag_name not in void_elements:
+                warnings.append(
+                    f"Unclosed HTML tag <{tag_name}> opened at line {line_num}. "
+                    f"Missing closing </{tag_name}> tag."
+                )
+
+        return warnings
 
     def _tool_update_file(self, args: dict[str, Any]) -> str:
         path = self._require_rel_path(args.get("path"))
@@ -686,28 +774,97 @@ class OrbitronKernel:
                     "file_size": len(file_content),
                 })
             updated = file_content.replace(old_content, new_content)
+
+            # Post-write validation for HTML files
+            html_warnings = []
+            if path.lower().endswith(('.html', '.htm', '.xhtml')):
+                html_warnings = self._validate_html_tags(updated)
+                if html_warnings:
+                    logger.warning("[Kernel] HTML validation warnings for %s: %s", path, html_warnings)
+
             self.file_ops.write_file(path, updated)
             replacements = file_content.count(old_content)
-            return json.dumps({
+            result = {
                 "ok": True,
                 "action": "update_file",
                 "mode": "find_replace",
                 "path": path,
                 "replacements": replacements,
-            })
+            }
+            if html_warnings:
+                result["html_warnings"] = html_warnings
+                result["hint"] = (
+                    "⚠️ HTML tag mismatch detected! When changing an opening tag (e.g., <div> → <main>), "
+                    "you MUST also change the corresponding closing tag (e.g., </div> → </main>). "
+                    "Fix these issues before submitting."
+                )
+            return json.dumps(result)
 
         # Mode: Append — add content to the end of the file
         if append:
             if not isinstance(content, str):
                 raise ValueError("content must be a string")
             self.file_ops.append_file(path, content)
-            return json.dumps({"ok": True, "action": "update_file", "mode": "append", "path": path})
+
+            # Post-write validation for HTML files
+            html_warnings = []
+            if path.lower().endswith(('.html', '.htm', '.xhtml')):
+                full_content = self.file_ops.read_file(path)
+                html_warnings = self._validate_html_tags(full_content)
+                if html_warnings:
+                    logger.warning("[Kernel] HTML validation warnings for %s: %s", path, html_warnings)
+
+            result = {"ok": True, "action": "update_file", "mode": "append", "path": path}
+            if html_warnings:
+                result["html_warnings"] = html_warnings
+                result["hint"] = (
+                    "⚠️ HTML tag mismatch detected! When changing an opening tag (e.g., <div> → <main>), "
+                    "you MUST also change the corresponding closing tag (e.g., </div> → </main>). "
+                    "Fix these issues before submitting."
+                )
+            return json.dumps(result)
 
         # Mode: Full Overwrite — replace entire file (existing behavior)
         if not isinstance(content, str):
             raise ValueError("content must be a string")
+
+        # Warn if overwriting an existing file — the agent should have read it first
+        existing_size = 0
+        if self.file_ops.file_exists(path):
+            try:
+                existing_content = self.file_ops.read_file(path)
+                existing_size = len(existing_content)
+                if len(existing_content.strip()) > 0 and len(content.strip()) < len(existing_content.strip()) * 0.5:
+                    # Overwrite is significantly shorter than existing content — likely accidental
+                    return json.dumps({
+                        "ok": False,
+                        "error": f"Refusing to overwrite '{path}': new content ({len(content)} chars) is much shorter than existing content ({existing_size} chars). This looks like an accidental overwrite. Use read_file first to see the current content, then use old_content/new_content (Find & Replace) for targeted edits.",
+                        "path": path,
+                        "existing_size": existing_size,
+                        "new_size": len(content),
+                        "hint": "Use read_file to see the current content, then use old_content + new_content for targeted edits instead of overwriting the entire file.",
+                    })
+            except Exception:
+                pass
+
         self.file_ops.write_file(path, content)
-        return json.dumps({"ok": True, "action": "update_file", "mode": "overwrite", "path": path})
+
+        # Post-write validation for HTML files
+        html_warnings = []
+        if path.lower().endswith(('.html', '.htm', '.xhtml')):
+            html_warnings = self._validate_html_tags(content)
+            if html_warnings:
+                logger.warning("[Kernel] HTML validation warnings for %s: %s", path, html_warnings)
+
+        result = {"ok": True, "action": "update_file", "mode": "overwrite", "path": path, "previous_size": existing_size}
+        if html_warnings:
+            result["html_warnings"] = html_warnings
+            result["hint"] = (
+                "⚠️ HTML tag mismatch detected! When changing an opening tag (e.g., <div> → <main>), "
+                "you MUST also change the corresponding closing tag (e.g., </div> → </main>). "
+                "Fix these issues before submitting."
+            )
+        return json.dumps(result)
 
     def _tool_delete_file(self, args: dict[str, Any]) -> str:
         path = self._require_rel_path(args.get("path"))
@@ -757,7 +914,7 @@ class OrbitronKernel:
 
     def _tool_run_command(self, args: dict[str, Any]) -> str:
         command = args.get("command", "")
-        timeout = int(args.get("timeout", 30))
+        timeout = int(args.get("timeout", 120))
         cwd_rel = args.get("cwd", ".")
         if not isinstance(command, str) or not command:
             return json.dumps({"ok": False, "error": "command must be a non-empty string"})
@@ -773,16 +930,78 @@ class OrbitronKernel:
                 encoding="utf-8",
                 errors="replace",
             )
-            return json.dumps({
-                "ok": result.returncode == 0,
+            # Build a structured result that's easy for LLMs to parse
+            success = result.returncode == 0
+            result_dict: dict[str, Any] = {
+                "ok": success,
                 "returncode": result.returncode,
-                "stdout": result.stdout,
-                "stderr": result.stderr,
-            })
+            }
+
+            # Smart output handling: truncate individual streams if they're very large
+            # but always include the exit code clearly
+            max_stream_chars = 30000  # per stream
+            stdout = result.stdout or ""
+            stderr = result.stderr or ""
+
+            if len(stdout) > max_stream_chars:
+                # Keep first 60% and last 30% of stdout
+                head_size = int(max_stream_chars * 0.6)
+                tail_size = int(max_stream_chars * 0.3)
+                stdout = stdout[:head_size] + f"\n...[{len(result.stdout) - head_size - tail_size} chars omitted]...\n" + stdout[-tail_size:]
+            if len(stderr) > max_stream_chars:
+                head_size = int(max_stream_chars * 0.6)
+                tail_size = int(max_stream_chars * 0.3)
+                stderr = stderr[:head_size] + f"\n...[{len(result.stderr) - head_size - tail_size} chars omitted]...\n" + stderr[-tail_size:]
+
+            result_dict["stdout"] = stdout
+            result_dict["stderr"] = stderr
+
+            # Add error classification for non-zero exit codes
+            if not success:
+                combined_output = (stderr + "\n" + stdout).lower()
+                if "command not found" in combined_output or "is not recognized" in combined_output:
+                    result_dict["error_type"] = "command_not_found"
+                    result_dict["suggestion"] = "The command was not found. Check that the required tool is installed and in your PATH."
+                elif "permission denied" in combined_output or "eacces" in combined_output:
+                    result_dict["error_type"] = "permission_denied"
+                    result_dict["suggestion"] = "Permission denied. Try running with appropriate permissions or check file ownership."
+                elif "timed out" in combined_output or "timeout" in combined_output:
+                    result_dict["error_type"] = "timeout"
+                    result_dict["suggestion"] = "The command timed out. Try increasing the timeout parameter."
+                elif any(w in combined_output for w in ("compilation error", "syntaxerror", "syntax error",
+                                                         "build failed", "compilation failed")):
+                    result_dict["error_type"] = "build_error"
+                    result_dict["suggestion"] = "Build/compilation failed. Check the stderr output for specific error messages."
+                elif any(w in combined_output for w in ("module not found", "importerror",
+                                                         "no module named", "cannot find module")):
+                    result_dict["error_type"] = "dependency_error"
+                    result_dict["suggestion"] = "A dependency is missing. Try running 'npm install' or 'pip install' first."
+                elif any(w in combined_output for w in ("test failed", "test failure", "assertionerror",
+                                                         "assertion error", "tests failed")):
+                    result_dict["error_type"] = "test_failure"
+                    result_dict["suggestion"] = "Tests failed. Check the test output for details on which tests failed."
+                else:
+                    result_dict["error_type"] = "unknown_error"
+                    result_dict["suggestion"] = f"Command exited with code {result.returncode}. Check stderr for error details."
+
+                # Add a concise error summary (first 5 lines of stderr)
+                if stderr:
+                    error_lines = [line for line in stderr.strip().split("\n") if line.strip()][:5]
+                    result_dict["error_summary"] = "\n".join(error_lines)
+
+            return json.dumps(result_dict, ensure_ascii=False)
         except subprocess.TimeoutExpired:
-            return json.dumps({"ok": False, "error": f"Command timed out after {timeout}s"})
+            return json.dumps({
+                "ok": False,
+                "error": f"Command timed out after {timeout}s",
+                "error_type": "timeout",
+                "suggestion": "The command took too long. Try increasing the timeout parameter or simplifying the command.",
+                "returncode": -1,
+                "stdout": "",
+                "stderr": f"Command timed out after {timeout} seconds",
+            })
         except Exception as e:
-            return json.dumps({"ok": False, "error": str(e)})
+            return json.dumps({"ok": False, "error": str(e), "returncode": -1, "stdout": "", "stderr": str(e)})
 
     def _tool_check_syntax(self, args: dict[str, Any]) -> str:
         path = self._require_rel_path(args.get("path"))
@@ -908,6 +1127,207 @@ class OrbitronKernel:
             })
         except Exception as e:
             return json.dumps({"ok": False, "error": str(e)})
+
+    def _tool_verify_build(self, args: dict[str, Any]) -> str:
+        """Detect project type and run the appropriate build command.
+
+        Automatically detects Angular, React, Vue, Node.js, Python, and other
+        project types from config files. Returns structured results with
+        success/failure status, error details, and suggestions.
+        """
+        path = self._require_rel_path(args.get("path", "."))
+        build_command_override = args.get("build_command", "")
+        timeout = int(args.get("timeout", 180))
+
+        project_dir = self.file_ops.workspace_root / path
+
+        if not project_dir.exists():
+            return json.dumps({"ok": False, "error": f"Project directory not found: {path}"})
+
+        # Detect project type and build command
+        project_type = "unknown"
+        build_cmd = build_command_override
+        install_cmd = None
+
+        if not build_cmd:
+            # Check for Angular
+            if (project_dir / "angular.json").exists() or (project_dir / ".angular-cli.json").exists():
+                project_type = "angular"
+                build_cmd = "npx ng build 2>&1"
+                install_cmd = "npm install 2>&1"
+            # Check for React (Create React App or Vite)
+            elif (project_dir / "package.json").exists():
+                try:
+                    pkg = json.loads((project_dir / "package.json").read_text(encoding="utf-8"))
+                    scripts = pkg.get("scripts", {})
+                    if "build" in scripts:
+                        build_script = scripts["build"]
+                        if "next" in build_script or "next" in pkg.get("dependencies", {}):
+                            project_type = "nextjs"
+                        elif "vite" in build_script:
+                            project_type = "vite"
+                        else:
+                            project_type = "react"
+                        build_cmd = "npm run build 2>&1"
+                        install_cmd = "npm install 2>&1"
+                    elif "start" in scripts:
+                        project_type = "node"
+                        build_cmd = "npm run start 2>&1"
+                        install_cmd = "npm install 2>&1"
+                    else:
+                        project_type = "node"
+                        build_cmd = "npm install 2>&1"
+                except Exception:
+                    project_type = "node"
+                    build_cmd = "npm install 2>&1"
+            # Check for Python
+            elif (project_dir / "pyproject.toml").exists():
+                project_type = "python"
+                build_cmd = "python -m build 2>&1"
+            elif (project_dir / "setup.py").exists():
+                project_type = "python"
+                build_cmd = "python setup.py check 2>&1"
+            elif (project_dir / "requirements.txt").exists():
+                project_type = "python"
+                build_cmd = "python -m pip check 2>&1"
+            # Check for .NET
+            elif any((project_dir / f).exists() for f in ["*.csproj", "*.sln"]):
+                project_type = "dotnet"
+                build_cmd = "dotnet build 2>&1"
+            # Check for Maven/Gradle (Java)
+            elif (project_dir / "pom.xml").exists():
+                project_type = "maven"
+                build_cmd = "mvn compile 2>&1"
+            elif (project_dir / "build.gradle").exists() or (project_dir / "build.gradle.kts").exists():
+                project_type = "gradle"
+                build_cmd = "./gradlew build 2>&1"
+            else:
+                return json.dumps({
+                    "ok": False,
+                    "error": "Could not detect project type. No package.json, angular.json, pyproject.toml, or other config files found.",
+                    "project_type": "unknown",
+                    "suggestion": "Specify a build_command parameter manually, or ensure the project directory contains a recognized config file.",
+                })
+
+        # Run install command first if needed (for Node.js projects)
+        install_result = None
+        if install_cmd and not build_command_override:
+            # Check if node_modules exists
+            if project_type in ("angular", "react", "nextjs", "vite", "node"):
+                if not (project_dir / "node_modules").exists():
+                    try:
+                        install_result = subprocess.run(
+                            install_cmd,
+                            shell=True,
+                            cwd=str(project_dir),
+                            capture_output=True,
+                            text=True,
+                            timeout=300,  # 5 min for npm install
+                            encoding="utf-8",
+                            errors="replace",
+                        )
+                        if install_result.returncode != 0:
+                            return json.dumps({
+                                "ok": False,
+                                "project_type": project_type,
+                                "build_command": build_cmd,
+                                "install_command": install_cmd,
+                                "install_failed": True,
+                                "install_stdout": install_result.stdout[-5000:] if len(install_result.stdout) > 5000 else install_result.stdout,
+                                "install_stderr": install_result.stderr[-5000:] if len(install_result.stderr) > 5000 else install_result.stderr,
+                                "error": "Dependency installation failed. Check install errors above.",
+                                "suggestion": "Try running 'npm install' manually to resolve dependency issues.",
+                            })
+                    except subprocess.TimeoutExpired:
+                        return json.dumps({
+                            "ok": False,
+                            "project_type": project_type,
+                            "error": "Dependency installation timed out (5 min).",
+                            "suggestion": "Install dependencies manually with 'npm install' and try again.",
+                        })
+
+        # Run the build command
+        try:
+            result = subprocess.run(
+                build_cmd,
+                shell=True,
+                cwd=str(project_dir),
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                encoding="utf-8",
+                errors="replace",
+            )
+
+            success = result.returncode == 0
+
+            # Smart truncation of output
+            max_output = 20000
+            stdout = result.stdout or ""
+            stderr = result.stderr or ""
+
+            if len(stdout) > max_output:
+                head = int(max_output * 0.6)
+                tail = int(max_output * 0.3)
+                stdout = stdout[:head] + f"\n...[{len(result.stdout) - head - tail} chars omitted]...\n" + stdout[-tail:]
+            if len(stderr) > max_output:
+                head = int(max_output * 0.6)
+                tail = int(max_output * 0.3)
+                stderr = stderr[:head] + f"\n...[{len(result.stderr) - head - tail} chars omitted]...\n" + stderr[-tail:]
+
+            build_result: dict[str, Any] = {
+                "ok": success,
+                "project_type": project_type,
+                "build_command": build_cmd,
+                "returncode": result.returncode,
+                "stdout": stdout,
+                "stderr": stderr,
+            }
+
+            if success:
+                build_result["✅ BUILD SUCCEEDED"] = f"exit code {result.returncode}"
+                build_result["suggestion"] = "Build completed successfully. You can proceed with testing or deployment."
+            else:
+                build_result["❌ BUILD FAILED"] = f"exit code {result.returncode}"
+                # Extract error summary
+                error_output = stderr or stdout
+                if error_output:
+                    error_lines = [line for line in error_output.strip().split("\n") if line.strip()][:10]
+                    build_result["error_summary"] = "\n".join(error_lines)
+                # Classify error
+                combined = (stderr + "\n" + stdout).lower()
+                if any(w in combined for w in ("compilation error", "syntaxerror", "syntax error")):
+                    build_result["error_type"] = "compilation_error"
+                    build_result["suggestion"] = "There are syntax/compilation errors. Fix the errors listed in the error summary above."
+                elif any(w in combined for w in ("module not found", "cannot find module", "no module named")):
+                    build_result["error_type"] = "dependency_error"
+                    build_result["suggestion"] = "A dependency is missing. Try running 'npm install' or 'pip install' first."
+                elif any(w in combined for w in ("type error", "typeerror")):
+                    build_result["error_type"] = "type_error"
+                    build_result["suggestion"] = "There are TypeScript/Type errors. Check the error messages for specific type mismatches."
+                else:
+                    build_result["error_type"] = "build_error"
+                    build_result["suggestion"] = "Build failed. Check the stderr and error_summary for details."
+
+            return json.dumps(build_result, ensure_ascii=False)
+
+        except subprocess.TimeoutExpired:
+            return json.dumps({
+                "ok": False,
+                "project_type": project_type,
+                "build_command": build_cmd,
+                "error": f"Build timed out after {timeout}s",
+                "error_type": "timeout",
+                "suggestion": "The build took too long. Try increasing the timeout or check for infinite loops.",
+            })
+        except Exception as e:
+            return json.dumps({
+                "ok": False,
+                "project_type": project_type,
+                "build_command": build_cmd,
+                "error": str(e),
+                "suggestion": "An unexpected error occurred during the build.",
+            })
 
     def _help(self) -> str:
         """Return help information."""

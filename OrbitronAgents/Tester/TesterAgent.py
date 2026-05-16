@@ -18,16 +18,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-from .skills.quality_check import QualityCheckSkill
-from .skills.browser_testing import BrowserTestingSkill
+from OrbitronAgents.Tester.skills.quality_check import QualityCheckSkill
+from OrbitronAgents.Tester.skills.browser_testing import BrowserTestingSkill
 
 # Import autonomous agent base
-try:
-    from ..base.autonomous_agent import AutonomousAgent, AgentLoopResult
-except ImportError:
-    import sys
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "base"))
-    from autonomous_agent import AutonomousAgent, AgentLoopResult
+from OrbitronAgents.base.autonomous_agent import AutonomousAgent, AgentLoopResult
 
 logger = logging.getLogger("TesterAgent")
 
@@ -71,7 +66,7 @@ class TesterAgent:
         agent_name: str = "tester",
         workspace_root: str | None = None,
         kernel=None,
-        max_rounds: int = 12,
+        max_rounds: int = 18,
     ):
         """Initialize the Tester Agent.
 
@@ -116,6 +111,31 @@ Be thorough. Be strict. Be critical. A product that passes your review should be
 - Never accept placeholder content, TODOs, or incomplete implementations
 - When in doubt, flag it as an issue — better safe than sorry
 
+## CRITICAL: Professional Quality & UX Standards
+You are not just testing for "does it work" — you are testing for PROFESSIONAL QUALITY:
+
+### Visual Quality (MANDATORY checks)
+- **Spacing & Layout**: Are margins, paddings, and gaps consistent and professional? Misaligned or cramped elements are MAJOR issues.
+- **Typography**: Is the font hierarchy clear? Are headings, body text, and labels properly sized and weighted?
+- **Color & Contrast**: Do colors work together? Is there sufficient contrast for readability?
+- **Visual Consistency**: Do all components share the same design language? No random style variations.
+- **Polish**: Are there hover effects, transitions, focus states? Does it feel smooth and professional?
+- **Responsive Design**: Does the layout work on mobile, tablet, AND desktop? Broken responsive = MAJOR issue.
+
+### UX Quality (MANDATORY checks)
+- **Intuitive Navigation**: Can a user figure out what to do without instructions?
+- **Clear Visual Hierarchy**: What's important? What's secondary? Can you tell at a glance?
+- **Feedback**: Do actions provide visual feedback? Loading states, success/error messages?
+- **Accessibility**: Can keyboard users navigate? Are there ARIA labels? Color contrast ratios?
+- **Error Handling**: What happens when things go wrong? Are errors handled gracefully?
+
+### Professional Standards
+- A "working" product with ugly design is NOT acceptable — flag visual issues as MAJOR
+- A "functional" product with poor UX is NOT acceptable — flag UX issues as MAJOR
+- Placeholder content, TODO comments, or "lorem ipsum" are CRITICAL issues
+- Inconsistent spacing, misaligned elements, or visual bugs are MAJOR issues
+- Missing hover states, transitions, or micro-interactions are at least MINOR issues
+
 ## CRITICAL RULE
 - **NEVER modify any files.** You are READ-ONLY. Use only inspection and verification tools.
 - If you accidentally create or modify a file, report it as a critical failure immediately.
@@ -124,14 +144,23 @@ Be thorough. Be strict. Be critical. A product that passes your review should be
 **The #1 priority is to verify the product actually builds/compiles/runs.** Do this BEFORE reading files in detail.
 
 For any software project (Angular, React, Vue, Node.js, Python, etc.):
-1. **Round 1-2: BUILD the project** — Run `run_command` with the build command:
-   - Angular: `cd <project_dir> && npx ng build 2>&1 | head -200`
-   - React: `cd <project_dir> && npm run build 2>&1 | head -100`
-   - Node.js: `cd <project_dir> && npm install && npm run build 2>&1 | head -100`
-   - Python: `python -m py_compile <file>` or `python <file>`
-   - Generic: `cd <project_dir> && npm run build 2>&1 | head -100` or look at package.json scripts first
-2. **If the build FAILS**: Report ALL compilation errors as CRITICAL issues. This is the most important finding.
-3. **If the build succeeds**: Continue with further testing.
+1. **Round 1-2: BUILD the project** — Use `verify_build` (PREFERRED) or `run_command`:
+   - **BEST**: Use `verify_build` with `path` pointing to the project directory. It auto-detects the project type and runs the correct build command.
+   - **ALTERNATIVE**: Use `run_command` with the appropriate build command and `timeout: 120` or higher.
+2. **Check the result**: ALWAYS check `returncode` — 0 means success, any other value means FAILURE.
+3. **If the build FAILS**: Report ALL compilation errors as CRITICAL issues. Read `stderr` and `error_summary` for details.
+4. **If the build succeeds**: Continue with further testing.
+
+## CRITICAL: Reading Command Output
+When you run `run_command` or `verify_build`, the result contains structured output:
+- `returncode`: 0 means success, any other value means failure. ALWAYS check this.
+- `stdout`: The command's standard output.
+- `stderr`: The command's error output. When returncode ≠ 0, this contains the error details.
+- `error_type`: Classification of the error (build_error, dependency_error, timeout, etc.)
+- `suggestion`: Actionable suggestion for fixing the error.
+- `error_summary`: First few lines of the error output for quick diagnosis.
+- If you see `❌ COMMAND FAILED` or `❌ BUILD FAILED`, the command did NOT succeed.
+- If you see `✅ COMMAND SUCCEEDED` or `✅ BUILD SUCCEEDED`, the command succeeded.
 
 ## CRITICAL: Start Real Applications for Testing
 If the product is a web application or has a dev server:
@@ -151,16 +180,33 @@ For non-web projects (Python scripts, markdown files, documents):
 1. **BUILD FIRST** (rounds 1-2): Run the build/compile command. If it fails, report ALL errors immediately.
 2. **START THE APP** (rounds 2-3): If it's a web project, start the dev server.
 3. **BROWSER TEST** (rounds 3-5): Open the app in a browser and check for runtime errors.
-4. **CODE REVIEW** (rounds 5-10): Read key files and check for quality issues.
-5. **SUBMIT** (round 10-12): Call `submit_test_result` with your findings.
+4. **VISUAL & UX REVIEW** (rounds 5-8): Check spacing, alignment, typography, colors, responsiveness, and overall polish.
+5. **CODE REVIEW** (rounds 8-10): Read key files and check for quality issues.
+6. **SUBMIT** (round 10-12): Call `submit_test_result` with your findings.
 
-## Quality Ratings
-- **"excellent"**: Build succeeds, app runs, no issues found.
-- **"good"**: Build succeeds, app runs with only minor issues.
-- **"poor"**: Build FAILS or app has critical issues. **This includes compilation errors.**
+## Quality Ratings — BE STRICT
+- **"excellent"**: Build succeeds, app runs, ZERO issues found. Professional visual quality. Polished UX. Production-ready.
+- **"good"**: Build succeeds, app runs, ONLY minor/cosmetic issues. NO major or critical issues at all. Still looks professional.
+- **"poor"**: Build FAILS, OR app has ANY major/critical issues. This includes:
+  - Compilation errors or build failures
+  - Broken functionality or JavaScript errors
+  - Missing CSS classes or broken styles
+  - Poor spacing, misaligned elements, or visual inconsistencies
+  - Missing responsive behavior
+  - Placeholder content or TODO comments
+  - Poor UX (confusing navigation, missing feedback, inaccessible)
+
+## CRITICAL: Rating Rules
+- If you find ANY issue with severity "major" or "critical", you MUST rate "poor" and set passed=False.
+- If you find 3+ minor issues, consider upgrading to "poor" — that many small problems indicate poor quality.
+- Do NOT rate "good" if there are major or critical issues. The system auto-corrects inconsistent ratings.
+- **Visual/UX issues are NOT just "cosmetic"** — poor spacing, misalignment, and ugly design are MAJOR issues.
+- **A product that works but looks amateur is NOT "good"** — rate it "poor" and flag the visual issues.
+- When in doubt, rate "poor" — it's better to flag issues than to let substandard work through.
 
 ## Tool Guidelines
-- `run_command`: **USE THIS FIRST** to build and start the application. This is your MOST IMPORTANT tool.
+- `verify_build`: **PREFERRED for build verification** — Auto-detects project type and runs the correct build command. Returns structured results with error classification. Use this FIRST to check if the project builds.
+- `run_command`: Execute shell commands — use for starting dev servers, running tests, etc. Always use `timeout: 120` or higher for builds.
 - `read_file`: Read artifact files AFTER verifying the build
 - `list_directory`: Explore the project structure
 - `search_files`: Search for patterns, TODOs, potential issues
@@ -178,10 +224,12 @@ For non-web projects (Python scripts, markdown files, documents):
 Be especially critical about:
 1. **Does the project BUILD?** If `ng build` or `npm run build` has errors, that's a CRITICAL failure.
 2. **Does the app RUN?** If `ng serve` or `npm start` fails, that's a CRITICAL failure.
-3. Are there TypeScript/compilation errors? Report EVERY error as a separate issue.
-4. Are there runtime errors in the browser console? Report them.
-5. Does it match the requirements? (Compare against the original task)
-6. Are there security issues? (XSS, eval, hardcoded secrets)
+3. **Does it LOOK PROFESSIONAL?** Poor spacing, misalignment, ugly colors, or amateur design are MAJOR issues.
+4. **Is the UX GOOD?** Confusing navigation, missing feedback, or inaccessible elements are MAJOR issues.
+5. Are there TypeScript/compilation errors? Report EVERY error as a separate issue.
+6. Are there runtime errors in the browser console? Report them.
+7. Does it match the requirements? (Compare against the original task)
+8. Are there security issues? (XSS, eval, hardcoded secrets)
 """
 
         self._autonomous_agent = AutonomousAgent(
@@ -197,6 +245,7 @@ Be especially critical about:
         self._autonomous_agent.register_search_tool()
         self._autonomous_agent.register_syntax_tool()
         self._autonomous_agent.register_command_tool()  # Needed to start test servers
+        self._autonomous_agent.register_verify_build_tool()  # Needed to verify builds
 
         # Register web search/fetch tools for verification
         self._autonomous_agent.register_tool(
@@ -319,12 +368,42 @@ Be especially critical about:
         logger.info("[TesterAgent] Removed file-write tools (kept run_command for testing servers)")
 
     def _handle_submit_test_result(self, args: dict[str, Any]) -> dict[str, Any]:
-        """Handle submit_test_result tool call from the autonomous loop."""
+        """Handle submit_test_result tool call from the autonomous loop.
+
+        Automatically corrects inconsistent ratings: if major or critical
+        issues are found, the quality rating is downgraded to 'poor' and
+        passed is set to False, regardless of what the LLM submitted.
+        """
+        quality_rating = args.get("quality_rating", "poor")
+        issues = args.get("issues", [])
+        passed = args.get("passed", False)
+
+        # Auto-correct: major or critical issues downgrade quality to "poor"
+        major_or_critical = [
+            i for i in issues
+            if isinstance(i, dict) and i.get("severity") in ("major", "critical")
+        ]
+        if major_or_critical:
+            if quality_rating in ("excellent", "good"):
+                logger.warning(
+                    "[TesterAgent] Auto-correcting quality_rating from '%s' to 'poor': "
+                    "%d major/critical issue(s) found",
+                    quality_rating, len(major_or_critical),
+                )
+                quality_rating = "poor"
+            if passed:
+                logger.warning(
+                    "[TesterAgent] Auto-correcting passed from True to False: "
+                    "%d major/critical issue(s) found",
+                    len(major_or_critical),
+                )
+                passed = False
+
         self._submit_test_data = {
-            "quality_rating": args.get("quality_rating", "poor"),
+            "quality_rating": quality_rating,
             "summary": args.get("summary", ""),
-            "issues": args.get("issues", []),
-            "passed": args.get("passed", False),
+            "issues": issues,
+            "passed": passed,
             "recommendations": args.get("recommendations", ""),
         }
         return {"ok": True, "message": "Test result submitted successfully"}

@@ -24,6 +24,13 @@ from enum import Enum, auto
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+# Ensure project root is on sys.path before importing OrbitronUtils
+_PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+from OrbitronUtils.dates import months_de, format_date_de, format_date_iso
+
 # Logging Setup
 LOG_FORMAT = "%(asctime)s | %(levelname)-8s | %(name)-20s | %(message)s"
 logging.basicConfig(
@@ -139,6 +146,7 @@ class QueueTaskStatus(Enum):
     """Status of a task in the async queue."""
     QUEUED = auto()
     RUNNING = auto()
+    WAITING_FOR_USER = auto()
     COMPLETED = auto()
     FAILED = auto()
 
@@ -157,6 +165,20 @@ class QueuedTask:
     completed_at: Optional[datetime] = None
     # Callback to send messages back to the user (str callable or ResponseSender-like object)
     send_callback: Optional[Any] = field(default=None, repr=False)
+
+
+@dataclass
+class PendingUserQuestion:
+    """Tracks a user clarification request and waits for a reply."""
+    question_id: str
+    chat_id: int
+    question: str
+    queue_task_id: Optional[str] = None
+    created_at: datetime = field(default_factory=datetime.now)
+    event: threading.Event = field(default_factory=threading.Event, repr=False)
+    answer: Optional[str] = None
+    source: str = "unknown"
+    timed_out: bool = False
 
 
 class AsyncTaskQueue:
@@ -238,6 +260,7 @@ class AsyncTaskQueue:
         """Get current queue status."""
         with self._lock:
             queued = [t for t in self._queue if t.status == QueueTaskStatus.QUEUED]
+            waiting = [t for t in self._queue if t.status == QueueTaskStatus.WAITING_FOR_USER]
             return {
                 "current_task": {
                     "task_id": self._current_task.task_id,
@@ -245,6 +268,7 @@ class AsyncTaskQueue:
                     "started_at": self._current_task.started_at.isoformat() if self._current_task.started_at else None,
                 } if self._current_task else None,
                 "queued_count": len(queued),
+                "waiting_count": len(waiting),
                 "queue": [
                     {
                         "task_id": t.task_id,
@@ -252,6 +276,14 @@ class AsyncTaskQueue:
                         "username": t.username,
                     }
                     for t in queued
+                ],
+                "waiting": [
+                    {
+                        "task_id": t.task_id,
+                        "description": t.description[:80],
+                        "username": t.username,
+                    }
+                    for t in waiting
                 ],
                 "total_processed": self._task_counter,
             }
@@ -263,15 +295,100 @@ class AsyncTaskQueue:
                 return self._current_task.description[:80]
             return None
 
-    def _worker_loop(self) -> None:
-        """Background worker: processes tasks one at a time."""
-        while self._running:
-            task = self._pick_next_task()
-            if task is None:
-                time.sleep(0.5)
-                continue
+    def resume_waiting_task(self, task_id: str, answer: str) -> bool:
+        """Resume a waiting task by re-queuing it with user clarification."""
+        if not task_id:
+            return False
 
-            self._process_task(task)
+        with self._lock:
+            for idx, task in enumerate(self._queue):
+                if task.task_id != task_id:
+                    continue
+                if task.status != QueueTaskStatus.WAITING_FOR_USER:
+                    return False
+
+                if answer:
+                    if "User clarification:" not in task.description or answer not in task.description:
+                        task.description = f"{task.description}\n\nUser clarification: {answer}"
+
+                task.status = QueueTaskStatus.QUEUED
+                task.result = None
+                task.started_at = None
+                task.completed_at = None
+
+                # Move to the end so backlog tasks run first
+                self._queue.pop(idx)
+                self._queue.append(task)
+
+                logger.info("[AsyncTaskQueue] Re-queued waiting task %s after user reply", task_id)
+                return True
+
+        return False
+
+    def cancel_task_for_chat(self, chat_id: int) -> Optional[QueuedTask]:
+        """Cancel the current or next queued task for a specific chat.
+
+        Cancels the running task if it belongs to the given chat_id,
+        otherwise removes the first queued task for that chat.
+
+        Args:
+            chat_id: The Telegram chat ID whose task should be cancelled
+
+        Returns:
+            The cancelled task, or None if no task was found for this chat
+        """
+        with self._lock:
+            # Check if the current running task belongs to this chat
+            if self._current_task and self._current_task.chat_id == chat_id:
+                cancelled = self._current_task
+                cancelled.status = QueueTaskStatus.FAILED
+                cancelled.result = {"success": False, "error": "Cancelled by user"}
+                cancelled.completed_at = datetime.now()
+                self._current_task = None
+                logger.info("[AsyncTaskQueue] Cancelled running task %s for chat_id=%d",
+                            cancelled.task_id, chat_id)
+                return cancelled
+
+            # Check queued tasks for this chat
+            for idx, task in enumerate(self._queue):
+                if task.chat_id == chat_id and task.status in (QueueTaskStatus.QUEUED, QueueTaskStatus.WAITING_FOR_USER):
+                    cancelled = self._queue.pop(idx)
+                    cancelled.status = QueueTaskStatus.FAILED
+                    cancelled.result = {"success": False, "error": "Cancelled by user"}
+                    cancelled.completed_at = datetime.now()
+                    logger.info("[AsyncTaskQueue] Cancelled queued task %s for chat_id=%d",
+                                cancelled.task_id, chat_id)
+                    return cancelled
+
+        return None
+
+    def _worker_loop(self) -> None:
+        """Background worker: processes tasks one at a time.
+        
+        Includes robust exception handling to prevent the worker from
+        crashing on unexpected errors. Failed tasks are marked as FAILED
+        and the worker continues processing.
+        """
+        while self._running:
+            try:
+                task = self._pick_next_task()
+                if task is None:
+                    time.sleep(0.5)
+                    continue
+
+                self._process_task(task)
+            except Exception as e:
+                logger.critical("[AsyncTaskQueue] Worker loop caught unexpected exception: %s", e, exc_info=True)
+                lifetime.log("AsyncTaskQueue", "worker_exception", {"error": str(e)})
+                # Ensure current task is marked as failed if it exists
+                with self._lock:
+                    if self._current_task and self._current_task.status == QueueTaskStatus.RUNNING:
+                        self._current_task.status = QueueTaskStatus.FAILED
+                        self._current_task.result = {"success": False, "error": f"Worker exception: {e}"}
+                        self._current_task.completed_at = datetime.now()
+                        self._current_task = None
+                # Brief pause to avoid tight error loops
+                time.sleep(1.0)
 
     def _pick_next_task(self) -> Optional[QueuedTask]:
         """Pick the next queued task (FIFO)."""
@@ -293,6 +410,8 @@ class AsyncTaskQueue:
             "source": "telegram",
             "chat_id": task.chat_id,
             "username": task.username,
+            "send_callback": task.send_callback,
+            "queue_task_id": task.task_id,
         }
 
         try:
@@ -300,8 +419,12 @@ class AsyncTaskQueue:
                 if self._task_processor else {"success": False, "error": "No processor"}
 
             task.result = result
-            task.status = QueueTaskStatus.COMPLETED if result.get("success") else QueueTaskStatus.FAILED
-            task.completed_at = datetime.now()
+            if result.get("waiting_for_user"):
+                task.status = QueueTaskStatus.WAITING_FOR_USER
+                task.completed_at = None
+            else:
+                task.status = QueueTaskStatus.COMPLETED if result.get("success") else QueueTaskStatus.FAILED
+                task.completed_at = datetime.now()
 
         except Exception as e:
             logger.exception("[AsyncTaskQueue] Task %s failed with exception", task.task_id)
@@ -312,6 +435,9 @@ class AsyncTaskQueue:
         finally:
             with self._lock:
                 self._current_task = None
+
+        if task.status == QueueTaskStatus.WAITING_FOR_USER:
+            return
 
         # Send completion notification
         self._notify_completion(task)
@@ -351,12 +477,28 @@ class AsyncTaskQueue:
             elif task.status == QueueTaskStatus.COMPLETED:
                 self._send_fallback_text(task)
             else:
-                # Task failed
-                error = task.result.get("error", "Unbekannter Fehler") if task.result else "Unbekannter Fehler"
-                if hasattr(task.send_callback, 'send_text'):
-                    task.send_callback.send_text(f"❌ Fehlgeschlagen: {task.description[:60]}\n⚠️ {error[:200]}")
+                # Task failed — but check for partial progress (artifacts created)
+                result = task.result or {}
+                artifacts = result.get("artifacts", [])
+                error = result.get("error", "Unbekannter Fehler") if result else "Unbekannter Fehler"
+                if artifacts:
+                    # Partial progress — files were created but task not fully complete
+                    try:
+                        reply = self._service_system._generate_result_reply(result, user_text=task.description)
+                    except Exception:
+                        reply = None
+                    if not reply:
+                        reply = f"⚠️ Teilweise erledigt: {len(artifacts)} Datei(en) erstellt, aber Aufgabe nicht vollständig abgeschlossen."
+                    if hasattr(task.send_callback, 'send_text'):
+                        task.send_callback.send_text(reply)
+                    else:
+                        task.send_callback(reply)
                 else:
-                    task.send_callback(f"❌ Fehlgeschlagen: {task.description[:60]}\n⚠️ {error[:200]}")
+                    # Complete failure — no artifacts created
+                    if hasattr(task.send_callback, 'send_text'):
+                        task.send_callback.send_text(f"❌ Fehlgeschlagen: {task.description[:60]}\n⚠️ {error[:200]}")
+                    else:
+                        task.send_callback(f"❌ Fehlgeschlagen: {task.description[:60]}\n⚠️ {error[:200]}")
 
             # --- Send document files AFTER text ---
             if task.status == QueueTaskStatus.COMPLETED and task.result:
@@ -503,11 +645,18 @@ class ServiceSystem:
         self.tester_message_handler = None
         self._telegram_thread: Optional[threading.Thread] = None
 
+        # Quick responder for simple requests
+        self.quick_responder = None
+
         self._running = False
         self._start_time: Optional[datetime] = None
 
         # Async task queue
         self._task_queue = AsyncTaskQueue()
+
+        # Pending user questions (ask_user)
+        self._pending_questions: dict[int, PendingUserQuestion] = {}
+        self._pending_questions_lock = threading.Lock()
 
         # Print header
         print("=" * 70)
@@ -580,6 +729,19 @@ class ServiceSystem:
                 self.workspace_root = Path(agent_workspace)
 
             self.workspace_root.mkdir(parents=True, exist_ok=True)
+
+            # 2b. Initialize QuickResponder for simple requests
+            try:
+                from OrbitronSystem.quick_response import QuickResponder
+                self.quick_responder = QuickResponder(
+                    kernel=self.kernel,
+                    workspace_root=str(self.workspace_root),
+                )
+                lifetime.log("QuickResponder", "startup_complete")
+                logger.info("[OK] QuickResponder ready")
+            except Exception as e:
+                logger.warning(f"[WARN] QuickResponder failed: {e}")
+                lifetime.log("QuickResponder", "startup_failed", {"error": str(e)})
 
             # 3. Start Planner Agent
             logger.info("[3/5] Starting Planner Agent...")
@@ -654,6 +816,7 @@ class ServiceSystem:
                 planning_timeout_seconds=900,  # 15 min timeout, then retry
                 execution_timeout_seconds=900,  # 15 min timeout, then retry
             )
+            self.orchestrator.set_user_interaction(self.ask_user)
             self.orchestrator.connect_to_message_bus()
 
             lifetime.log("Orchestrator", "startup_complete", {
@@ -713,13 +876,14 @@ class ServiceSystem:
             print("\n" + "=" * 70)
             print("SYSTEM READY")
             print("=" * 70)
-            print(f"  MessageBus:    {'[OK]' if self.message_bus else '[FAIL]'}")
-            print(f"  Kernel:        {'[OK]' if self.kernel else '[FAIL]'}")
-            print(f"  Planner:       {'[OK]' if self.planner else '[FAIL]'}")
-            print(f"  Executor:      {'[OK]' if self.executor else '[FAIL]'}")
-            print(f"  Tester:        {'[OK]' if self.tester else '[FAIL]'}")
-            print(f"  Orchestrator:  {'[OK]' if self.orchestrator else '[FAIL]'}")
-            print(f"  TelegramBot:   {'[OK]' if self.telegram_bot else '[FAIL]'}")
+            print(f"  MessageBus:      {'[OK]' if self.message_bus else '[FAIL]'}")
+            print(f"  Kernel:          {'[OK]' if self.kernel else '[FAIL]'}")
+            print(f"  QuickResponder:  {'[OK]' if self.quick_responder else '[FAIL]'}")
+            print(f"  Planner:         {'[OK]' if self.planner else '[FAIL]'}")
+            print(f"  Executor:        {'[OK]' if self.executor else '[FAIL]'}")
+            print(f"  Tester:          {'[OK]' if self.tester else '[FAIL]'}")
+            print(f"  Orchestrator:    {'[OK]' if self.orchestrator else '[FAIL]'}")
+            print(f"  TelegramBot:     {'[OK]' if self.telegram_bot else '[FAIL]'}")
             print("=" * 70)
 
             return True
@@ -843,6 +1007,9 @@ class ServiceSystem:
     ) -> dict[str, Any]:
         """Process a task through the complete system.
 
+        First tries a quick response for simple requests. If the request
+        is complex, falls through to the full Orchestrator pipeline.
+
         Args:
             description: Task description
             context: Optional context
@@ -854,6 +1021,33 @@ class ServiceSystem:
         if not self._running:
             logger.error("[ServiceSystem] Cannot process task: System not running")
             return {"success": False, "error": "System not running"}
+
+        # Try quick response first (for simple requests like file listings)
+        if self.quick_responder:
+            try:
+                chat_id = (context or {}).get("chat_id") if context else None
+                username = (context or {}).get("username", "user") if context else "user"
+                quick_result = self.quick_responder.try_quick_response(
+                    user_text=description,
+                    chat_id=chat_id,
+                    username=username,
+                )
+                if quick_result and quick_result.get("is_simple"):
+                    logger.info("[ServiceSystem] Quick response handled for: %s", description[:80])
+                    lifetime.log("ServiceSystem", "quick_response", {
+                        "description": description[:100],
+                    })
+                    return {
+                        "success": True,
+                        "task_id": f"quick-{datetime.now().strftime('%Y%m%d-%H%M%S')}",
+                        "status": "COMPLETED",
+                        "answer": quick_result.get("response", ""),
+                        "summary": quick_result.get("response", ""),
+                        "task_type": "quick_response",
+                        "iterations": {"planning": 0, "execution": 0, "testing": 0},
+                    }
+            except Exception as e:
+                logger.warning("[ServiceSystem] Quick response failed, falling through: %s", e)
 
         if not self.orchestrator:
             logger.error("[ServiceSystem] Cannot process task: Orchestrator not available")
@@ -889,6 +1083,14 @@ class ServiceSystem:
         # acknowledgment and the final result reply are enough.
 
         # Log result
+        if result.get("waiting_for_user"):
+            logger.info("[ServiceSystem] TASK WAITING FOR USER INPUT")
+            lifetime.log("ServiceSystem", "task_waiting_for_user", {
+                "task_id": task_id,
+                "question": result.get("question", ""),
+            })
+            return result
+
         if result.get("success"):
             logger.info("=" * 70)
             logger.info("[ServiceSystem] TASK COMPLETED SUCCESSFULLY")
@@ -907,17 +1109,120 @@ class ServiceSystem:
                 "plan_title": result.get("plan", {}).get("title"),
             })
         else:
-            logger.error("=" * 70)
-            logger.error("[ServiceSystem] TASK FAILED")
-            logger.error("[ServiceSystem]   Error: %s", result.get('error', 'Unknown error'))
-            logger.error("=" * 70)
+            # Check if we have partial progress (artifacts created despite failure)
+            artifacts = result.get("artifacts", [])
+            test_issues = result.get("test_issues", [])
+            if artifacts:
+                logger.warning("=" * 70)
+                logger.warning("[ServiceSystem] TASK COMPLETED WITH ISSUES (partial progress)")
+                logger.warning("[ServiceSystem]   Task ID: %s", result.get('task_id'))
+                logger.warning("[ServiceSystem]   Artifacts created: %d", len(artifacts))
+                logger.warning("[ServiceSystem]   Test issues: %d", len(test_issues))
+                logger.warning("[ServiceSystem]   Iterations: %s", result.get('iterations'))
+                logger.warning("=" * 70)
+            else:
+                logger.error("=" * 70)
+                logger.error("[ServiceSystem] TASK FAILED")
+                logger.error("[ServiceSystem]   Error: %s", result.get('error', 'Unknown error'))
+                logger.error("=" * 70)
 
             lifetime.log("ServiceSystem", "task_failed", {
                 "task_id": task_id,
                 "error": result.get("error"),
+                "artifacts_count": len(artifacts),
             })
 
         return result
+
+    def _send_user_message(self, send: Optional[Any], msg: str) -> None:
+        """Send a message using a ResponseSender or a plain callback."""
+        if not msg:
+            return
+        try:
+            if hasattr(send, "send_text"):
+                send.send_text(msg)
+            elif callable(send):
+                send(msg)
+        except Exception as e:
+            logger.warning("[ServiceSystem] Failed to send user message: %s", e)
+
+    def _try_resolve_pending_question(
+        self,
+        chat_id: int,
+        text: str,
+        send: Optional[Any] = None,
+    ) -> bool:
+        """Resolve a pending question if one exists for this chat."""
+        if chat_id is None:
+            return False
+
+        with self._pending_questions_lock:
+            entry = self._pending_questions.get(chat_id)
+            if not entry:
+                return False
+            entry.answer = text
+            entry.event.set()
+            self._pending_questions.pop(chat_id, None)
+
+        if entry.timed_out and entry.queue_task_id and self._task_queue:
+            resumed = self._task_queue.resume_waiting_task(entry.queue_task_id, text)
+            if resumed:
+                logger.info("[ServiceSystem] Resumed waiting task %s after user reply", entry.queue_task_id)
+
+        if send:
+            self._send_user_message(send, "Danke, ich mache weiter.")
+
+        logger.info("[ServiceSystem] User reply received for pending question (chat_id=%s)", chat_id)
+        return True
+
+    def ask_user(
+        self,
+        question: str,
+        context: Optional[dict[str, Any]] = None,
+        timeout_s: int = 300,
+    ) -> Optional[str]:
+        """Ask the user a question and wait for a reply."""
+        if not question:
+            return None
+
+        ctx = context or {}
+        chat_id = ctx.get("chat_id")
+        send = ctx.get("send_callback")
+        source = ctx.get("source", "unknown")
+        queue_task_id = ctx.get("queue_task_id")
+
+        if chat_id is None:
+            logger.warning("[ServiceSystem] ask_user called without chat_id")
+            return None
+
+        if send is None:
+            logger.warning("[ServiceSystem] ask_user called without send_callback (chat_id=%s)", chat_id)
+            return None
+
+        question_id = f"uq-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{chat_id}"
+        entry = PendingUserQuestion(
+            question_id=question_id,
+            chat_id=chat_id,
+            queue_task_id=queue_task_id,
+            question=question,
+            source=source,
+        )
+
+        with self._pending_questions_lock:
+            if chat_id in self._pending_questions:
+                logger.warning("[ServiceSystem] Overwriting existing pending question for chat_id=%s", chat_id)
+            self._pending_questions[chat_id] = entry
+
+        logger.info("[ServiceSystem] Asking user (chat_id=%s): %s", chat_id, question[:100])
+        self._send_user_message(send, question)
+
+        if not entry.event.wait(timeout_s):
+            logger.warning("[ServiceSystem] ask_user timed out (chat_id=%s)", chat_id)
+            with self._pending_questions_lock:
+                entry.timed_out = True
+            return None
+
+        return entry.answer
 
     def handle_user_message(
         self,
@@ -925,24 +1230,72 @@ class ServiceSystem:
         chat_id: int,
         username: str,
         send: Optional[callable] = None,
+        reply_context: Optional[str] = None,
     ) -> str:
         """Handle inbound user message from Telegram.
 
-        Enqueues the task for async processing and returns an immediate
-        acknowledgment. The user gets a completion notification when the
-        task finishes.
+        First tries a quick response for simple requests (file listings,
+        simple questions, etc.). If the request is complex, enqueues it
+        for the full Orchestrator pipeline.
+
+        Args:
+            text: The user's message text
+            chat_id: Telegram chat ID
+            username: Telegram username
+            send: Callback for sending responses
+            reply_context: Context from the message being replied to (Telegram reply_to_message)
         """
+        if self._try_resolve_pending_question(chat_id, text, send):
+            return "Antwort erhalten."
+
+        # Build the full task description including reply context and current date
+        full_text = text
+        if reply_context:
+            full_text = f"{text}\n{reply_context}"
+            logger.info("[ServiceSystem] Including reply context in task: %s", reply_context[:100])
+
+        # Inject current date into task description so all agents know the correct date
+        current_date_de = format_date_de()
+        current_date_iso = format_date_iso()
+        date_context = f"\n[Aktuelles Datum: {current_date_de} ({current_date_iso})]"
+        full_text_with_date = full_text + date_context
+
         logger.info("[ServiceSystem] [Telegram] Message from %s (chat_id=%s): %s...", 
                      username, chat_id, text[:60])
         lifetime.log("ServiceSystem", "telegram_message_received", {
             "chat_id": chat_id,
             "username": username,
             "text_preview": text[:100],
+            "has_reply_context": reply_context is not None,
         })
 
-        # Enqueue the task for background processing
+        # Try quick response first for simple requests
+        if self.quick_responder:
+            try:
+                quick_result = self.quick_responder.try_quick_response(
+                    user_text=text,
+                    chat_id=chat_id,
+                    username=username,
+                    reply_context=reply_context,
+                )
+                if quick_result and quick_result.get("is_simple"):
+                    logger.info("[ServiceSystem] Quick response handled: %s", text[:80])
+                    lifetime.log("ServiceSystem", "quick_response", {
+                        "chat_id": chat_id,
+                        "text_preview": text[:100],
+                    })
+                    response_text = quick_result.get("response", "")
+                    if response_text and callable(send):
+                        send(response_text)
+                    elif response_text:
+                        return response_text
+                    return "Erledigt."
+            except Exception as e:
+                logger.warning("[ServiceSystem] Quick response failed, falling through: %s", e)
+
+        # Complex request — enqueue for full pipeline processing
         queued_task = self._task_queue.enqueue(
-            description=text,
+            description=full_text_with_date,
             chat_id=chat_id,
             username=username,
             send_callback=send,
@@ -976,7 +1329,7 @@ class ServiceSystem:
         """Synchronous task processor used by the async queue worker.
 
         Args:
-            description: Task description
+            description: Task description (may include reply context)
             context: Context dict (source, chat_id, username)
 
         Returns:
@@ -1265,14 +1618,19 @@ class ServiceSystem:
         parts = []
 
         success = result.get("success", False)
-        parts.append(f"Erfolgreich: {'ja' if success else 'nein'}")
+        artifacts = result.get("artifacts", [])
+
+        # Check for partial progress — files created even if not fully successful
+        if not success and artifacts:
+            parts.append(f"Teilweise erfolgreich: {len(artifacts)} Datei(en) erstellt, aber Aufgabe nicht vollständig abgeschlossen")
+        else:
+            parts.append(f"Erfolgreich: {'ja' if success else 'nein'}")
 
         # Autonomous loop result
         if result.get("autonomous"):
             summary = result.get("summary") or result.get("answer", "")
             if summary:
                 parts.append(f"Zusammenfassung: {summary[:500]}")
-            artifacts = result.get("artifacts") or []
             if artifacts:
                 parts.append(f"Erstellte Dateien: {', '.join(str(a) for a in artifacts[:10])}")
             return "\n".join(parts)
@@ -1289,7 +1647,6 @@ class ServiceSystem:
         if exec_summary:
             parts.append(f"Ergebnis: {exec_summary[:500]}")
 
-        artifacts = result.get("artifacts", [])
         if artifacts:
             parts.append(f"Erstellte Dateien: {', '.join(str(a) for a in artifacts[:10])}")
 
@@ -1455,16 +1812,45 @@ class ServiceSystem:
         print("=" * 70)
 
     def run_forever(self) -> None:
-        """Run the service system forever (main entry point)."""
+        """Run the service system forever (main entry point).
+        
+        Includes global exception handler to prevent the system from
+        crashing on unexpected errors in the main loop.
+        """
         if not self.start():
             logger.error("Failed to start ServiceSystem")
             sys.exit(1)
+
+        # Install global exception handler to prevent crashes
+        def _global_exception_handler(exc_type, exc_value, exc_tb):
+            """Handle uncaught exceptions gracefully instead of crashing."""
+            logger.critical(
+                "[ServiceSystem] Uncaught exception in main thread: %s: %s",
+                exc_type.__name__,
+                exc_value,
+                exc_info=(exc_type, exc_value, exc_tb),
+            )
+            lifetime.log("ServiceSystem", "uncaught_exception", {
+                "type": exc_type.__name__,
+                "message": str(exc_value),
+            })
+            # Don't crash — log and continue
+            print(f"\n⚠️ Uncaught exception: {exc_type.__name__}: {exc_value}")
+            print("   The system will continue running. Check logs for details.")
+
+        old_handler = sys.excepthook
+        sys.excepthook = _global_exception_handler
 
         try:
             self.interactive_mode()
         except KeyboardInterrupt:
             logger.info("Interrupted by user")
+        except Exception as e:
+            logger.critical("[ServiceSystem] Fatal error in run_forever: %s", e, exc_info=True)
+            lifetime.log("ServiceSystem", "fatal_error", {"error": str(e)})
         finally:
+            # Restore original exception handler
+            sys.excepthook = old_handler
             self.stop()
 
     def interactive_mode(self) -> None:
@@ -1485,6 +1871,9 @@ class ServiceSystem:
                 user_input = input("\nOrbitron> ").strip()
 
                 if not user_input:
+                    continue
+
+                if self._try_resolve_pending_question(0, user_input, lambda msg: print(f"\n{msg}")):
                     continue
 
                 if user_input.lower() == "quit":

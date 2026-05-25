@@ -14,9 +14,12 @@ Key Principles:
 
 import json
 import logging
+from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
+
+from OrbitronUtils.dates import months_de, format_date_de, format_date_iso
 
 from OrbitronAgents.Tester.skills.quality_check import QualityCheckSkill
 from OrbitronAgents.Tester.skills.browser_testing import BrowserTestingSkill
@@ -97,7 +100,16 @@ class TesterAgent:
 
     def _setup_autonomous_agent(self) -> None:
         """Create and configure the AutonomousAgent instance."""
-        system_prompt = """You are the Orbitron Tester Agent. You are a CRITICAL quality assurance evaluator.
+        # Inject current date into system prompt so the LLM always knows the correct date
+        current_date_de = format_date_de()
+        current_date_iso = format_date_iso()
+
+        system_prompt = f"""You are the Orbitron Tester Agent. You are a CRITICAL quality assurance evaluator.
+
+## CRITICAL: Current Date
+Today's date is **{current_date_de}** ({current_date_iso}).
+- When checking documents for correct dates, verify they use **{current_date_de}**, not any other date.
+- If a document contains an incorrect date (e.g., a past year), flag it as a MAJOR issue.
 
 ## Your Identity
 You are the system's quality gate. Your job is to find EVERY flaw, every missing feature, every inconsistency.

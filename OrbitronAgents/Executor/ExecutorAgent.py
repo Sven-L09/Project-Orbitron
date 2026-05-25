@@ -20,6 +20,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
+from OrbitronUtils.dates import months_de, format_date_de, format_date_iso
+
 # Import refactored skills from skills module
 from OrbitronAgents.Executor.skills import ProgrammingSkill, WordSkill, OpenCodeSkill, ExecutorSkill
 from OrbitronAgents.Executor.execution_state import ExecutionState, StepResult
@@ -42,6 +44,8 @@ class ExecutionResult:
     error: Optional[str] = None
     tool_calls: int = 0
     rounds: int = 0
+    needs_user_input: bool = False
+    question: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -51,6 +55,8 @@ class ExecutionResult:
             "error": self.error,
             "tool_calls": self.tool_calls,
             "rounds": self.rounds,
+            "needs_user_input": self.needs_user_input,
+            "question": self.question,
         }
 
 
@@ -115,7 +121,17 @@ class ExecutorAgent:
 
     def _setup_autonomous_agent(self) -> None:
         """Create and configure the AutonomousAgent instance."""
-        system_prompt = """You are the Orbitron Executor Agent. You receive a GOAL and autonomously implement it.
+        # Inject current date into system prompt so the LLM always knows the correct date
+        current_date_de = format_date_de()
+        current_date_iso = format_date_iso()
+
+        system_prompt = f"""You are the Orbitron Executor Agent. You receive a GOAL and autonomously implement it.
+
+## CRITICAL: Current Date
+Today's date is **{current_date_de}** ({current_date_iso}).
+- ALWAYS use this date when writing dates in documents, emails, or any content.
+- NEVER guess or assume a different date. If you need the exact time, call `get_current_date`.
+- When creating documents with dates (letters, reports, etc.), use the date **{current_date_de}**.
 
 ## Your Identity
 You are the system's intelligent builder and implementer. You write code, create files, execute commands, and verify your work.
@@ -129,6 +145,14 @@ You have LIMITED rounds. You MUST call `submit_result` within 10-15 rounds.
 - Round 12-15: Fix any remaining issues and call `submit_result`.
 - Do NOT read more than 5 files total. If you need context, read the KEY file and start implementing.
 - A working implementation that COMPILES is better than a perfect implementation that never completes.
+
+## ⚠️ CRITICAL: STOP READING — START WRITING
+The #1 mistake is reading too many files and running out of rounds before creating anything.
+- You MUST create or modify at least ONE file by round 5. If you haven't written any code by round 5, STOP reading and START writing.
+- Reading files does NOT count as progress. Only creating/modifying files counts.
+- If you catch yourself reading more than 5 files, STOP immediately and start implementing with what you know.
+- It is better to submit PARTIAL work (success=True with notes about what's missing) than to submit NOTHING (success=False with no files created).
+- When in doubt, WRITE CODE NOW and verify LATER.
 
 ## CRITICAL: Build Verification (MANDATORY)
 Before calling `submit_result`, you MUST verify that your changes compile/build correctly:
@@ -152,6 +176,12 @@ When you run `run_command` or `verify_build`, the result contains structured out
 
 ## CRITICAL: You MUST Create/Modify Files
 Your job is to IMPLEMENT changes, not just ANALYZE the codebase. You MUST use `create_file`, `update_file`, `create_document`, or `create_report` at least once before calling `submit_result`. If you call `submit_result` without having created or modified any files, that is a FAILURE. Reading files and reporting "looks good" is NOT acceptable.
+
+## CRITICAL: How to Set `success` in submit_result
+- Set `success: true` if you have created or modified ANY files — even if the task is only partially complete. Partial progress is still progress.
+- Set `success: false` ONLY if you created ZERO files and the task completely failed (e.g., you couldn't even start).
+- Use the `notes` field to describe what remains to be done. For example: `notes: "Created 7 of 15 components. Remaining: Hero, Footer, Contact components need to be created."`
+- NEVER set `success: false` just because the task isn't 100% complete. If files were created, that's a success — the system will handle continuation.
 
 ## Your Capabilities
 - Read files and directories to understand context
@@ -200,6 +230,18 @@ Your job is to IMPLEMENT changes, not just ANALYZE the codebase. You MUST use `c
 - `create_report`: Create a structured Word report with a title and multiple sections
 - `submit_result`: **TERMINAL TOOL** — Call this when you are satisfied with your work
 - `ask_question`: **TERMINAL TOOL** — Call this if you need clarification
+
+## ⛔ CRITICAL: NEVER Write Custom Document Generation Scripts
+**NEVER** write custom Python scripts (like `generate_doc.py`) that use `python-docx` directly to create Word documents. The `create_report` and `create_document` tools handle ALL document generation needs, including:
+- Professional headers with document title
+- Footers with date and page numbers
+- Table of contents (TOC) with clickable entries
+- Cover pages with title, subtitle, author, date
+- Proper formatting and styling
+
+If a tester reports issues with headers, footers, TOC, or formatting, **use `create_report` or `create_document` again** with corrected content — do NOT write a Python script to bypass these tools. The tools have been enhanced to automatically add professional headers, footers, TOC fields, and remove duplicate titles.
+
+If you find yourself wanting to write `from docx import Document` or `pip install python-docx`, STOP and use `create_report` instead.
 
 ## CRITICAL: File Editing Rules
 - ⚠️ **ALWAYS read a file BEFORE editing it.** The system will BLOCK edits to files you haven't read first. This prevents accidental overwrites.
@@ -297,6 +339,61 @@ Your job is to IMPLEMENT changes, not just ANALYZE the codebase. You MUST use `c
             handler=self._handle_ask_question,
         )
 
+        # Register get_current_date tool — provides the current date and time
+        self._autonomous_agent.register_tool(
+            name="get_current_date",
+            description="Get the current date and time. Use this whenever you need to know today's date for documents, timestamps, or any date-related content. ALWAYS call this tool before writing dates in documents — never guess or assume the current date.",
+            schema={
+                "type": "object",
+                "required": [],
+                "properties": {
+                    "format": {
+                        "type": "string",
+                        "description": "Date format: 'iso' (2026-05-17), 'de' (17. Mai 2026), 'de_long' (Sonntag, 17. Mai 2026), or 'full' (2026-05-17 21:08:09)",
+                        "enum": ["iso", "de", "de_long", "full"],
+                        "default": "de",
+                    },
+                },
+            },
+            handler=self._handle_get_current_date,
+        )
+
+    def _handle_get_current_date(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Handle get_current_date tool call — returns the current date and time."""
+        fmt = args.get("format", "de")
+        now = datetime.now()
+        if fmt == "iso":
+            date_str = now.strftime("%Y-%m-%d")
+        elif fmt == "de":
+            # German format: 17. Mai 2026
+            months = {
+                1: "Januar", 2: "Februar", 3: "März", 4: "April",
+                5: "Mai", 6: "Juni", 7: "Juli", 8: "August",
+                9: "September", 10: "Oktober", 11: "November", 12: "Dezember",
+            }
+            date_str = f"{now.day}. {months[now.month]} {now.year}"
+        elif fmt == "de_long":
+            days = {
+                0: "Montag", 1: "Dienstag", 2: "Mittwoch", 3: "Donnerstag",
+                4: "Freitag", 5: "Samstag", 6: "Sonntag",
+            }
+            months = {
+                1: "Januar", 2: "Februar", 3: "März", 4: "April",
+                5: "Mai", 6: "Juni", 7: "Juli", 8: "August",
+                9: "September", 10: "Oktober", 11: "November", 12: "Dezember",
+            }
+            date_str = f"{days[now.weekday()]}, {now.day}. {months[now.month]} {now.year}"
+        else:  # full
+            date_str = now.strftime("%Y-%m-%d %H:%M:%S")
+        return {
+            "ok": True,
+            "date": date_str,
+            "iso": now.strftime("%Y-%m-%d"),
+            "timestamp": now.isoformat(),
+            "weekday": now.strftime("%A"),
+            "message": f"Current date: {date_str}",
+        }
+
     def _handle_submit_result(self, args: dict[str, Any]) -> dict[str, Any]:
         """Handle submit_result tool call from the autonomous loop."""
         self._submit_result_data = {
@@ -314,6 +411,33 @@ Your job is to IMPLEMENT changes, not just ANALYZE the codebase. You MUST use `c
             "message": "Question forwarded to Orchestrator",
             "question": args.get("question", ""),
         }
+
+    def _extract_question_from_loop(self, loop_result: AgentLoopResult) -> str:
+        """Extract a question string from an ask_question terminal result."""
+        if not loop_result:
+            return ""
+
+        terminal = loop_result.metadata.get("terminal_result", {}) if hasattr(loop_result, "metadata") else {}
+        if isinstance(terminal, dict):
+            result = terminal.get("result")
+            if isinstance(result, dict):
+                question = result.get("question")
+                if isinstance(question, str) and question.strip():
+                    return question.strip()
+
+        # Fallback: try to parse JSON content
+        try:
+            payload = json.loads(loop_result.content or "")
+            if isinstance(payload, dict):
+                inner = payload.get("result", payload)
+                if isinstance(inner, dict):
+                    question = inner.get("question")
+                    if isinstance(question, str):
+                        return question.strip()
+        except Exception:
+            pass
+
+        return ""
 
     # ========== Autonomous Execution ==========
 
@@ -368,6 +492,22 @@ Your job is to IMPLEMENT changes, not just ANALYZE the codebase. You MUST use `c
                 state.record_file_created(path, op.get("size_bytes", 0))
             elif path and action == "delete_file":
                 state.record_file_deleted(path)
+
+        if loop_result.terminal_tool == "ask_question":
+            question = self._extract_question_from_loop(loop_result)
+            result = ExecutionResult(
+                success=False,
+                summary="User input required to continue.",
+                artifacts=loop_artifacts,
+                error="user_input_required",
+                tool_calls=loop_result.tool_calls_made,
+                rounds=loop_result.rounds_used,
+                needs_user_input=True,
+                question=question or "Please clarify the requirement.",
+            )
+            state.mark_completed(success=False, error_message=result.error)
+            logger.info("[ExecutorAgent] Asking user for clarification")
+            return result
 
         # Build result from loop output
         if self._submit_result_data:

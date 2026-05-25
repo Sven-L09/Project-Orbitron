@@ -15,7 +15,9 @@ import re
 from datetime import datetime
 from enum import Enum, auto
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Callable
+
+from OrbitronUtils.dates import months_de, format_date_de, format_date_iso
 
 logger = logging.getLogger("Orchestrator")
 
@@ -174,11 +176,29 @@ class MemoryStore:
             self.short_term = self.short_term[-20:]
     
     def remember(self, key: str, value: Any) -> None:
-        """Store a fact in long-term memory."""
+        """Store a fact in long-term memory.
+        
+        Limits long-term memory to MAX_LONG_TERM_ENTRIES to prevent
+        unbounded growth of facts.json.
+        """
         self.long_term[key] = {
             "value": value,
             "updated": datetime.now().isoformat()
         }
+        
+        # Enforce size limit on long-term memory
+        max_entries = 200  # Maximum number of facts to keep
+        if len(self.long_term) > max_entries:
+            # Remove oldest entries (sorted by 'updated' timestamp)
+            sorted_keys = sorted(
+                self.long_term.keys(),
+                key=lambda k: self.long_term[k].get("updated", ""),
+            )
+            keys_to_remove = sorted_keys[:len(self.long_term) - max_entries]
+            for old_key in keys_to_remove:
+                del self.long_term[old_key]
+            logger.info("[MemoryStore] Trimmed %d oldest long-term memory entries", len(keys_to_remove))
+        
         self.save_long_term()
     
     def recall(self, key: str) -> Any | None:
@@ -208,6 +228,7 @@ class TaskStatus(Enum):
     PLAN_REVISION = auto()     # Plan needs revision
     READY_FOR_EXECUTION = auto()  # Plan approved, ready to execute
     EXECUTING = auto()         # Execution in progress
+    WAITING_FOR_USER = auto()  # Waiting for user clarification
     COMPLETED = auto()         # Task completed successfully
     FAILED = auto()            # Task failed
     CANCELLED = auto()         # Task cancelled
@@ -331,6 +352,11 @@ class Task:
         self.error_message = error_message
         self.completed_at = datetime.now()
         self._update_status(TaskStatus.FAILED, error_message[:200])
+
+    def set_waiting_for_user(self, question: str) -> None:
+        """Mark task as waiting for user clarification."""
+        reason = f"Waiting for user clarification: {question[:200]}" if question else "Waiting for user clarification"
+        self._update_status(TaskStatus.WAITING_FOR_USER, reason)
     
     def get_planning_context(self) -> dict[str, Any]:
         """Get context for planning request - with size limits."""
@@ -414,6 +440,7 @@ class TaskOrchestrator:
         max_planning_iterations: int = 3,
         planning_timeout_seconds: int = 900,
         execution_timeout_seconds: int = 900,
+        ask_user_callback: Optional[Callable[[str, Optional[dict[str, Any]], int], Optional[str]]] = None,
     ):
         """Initialize the Task Orchestrator.
 
@@ -423,6 +450,7 @@ class TaskOrchestrator:
             max_planning_iterations: Maximum planning revision loops
             planning_timeout_seconds: Timeout for planning requests (default 15 min)
             execution_timeout_seconds: Timeout for execution requests (default 15 min)
+            ask_user_callback: Optional callback for user clarification requests
         """
         self.kernel = kernel
         self.workspace_root = Path(workspace_root) if workspace_root else Path(__file__).resolve().parents[2]
@@ -441,6 +469,7 @@ class TaskOrchestrator:
         self._executor_bridge: Optional[OrchestratorExecutorBridge] = None
         self._tester_bridge: Optional[OrchestratorTesterBridge] = None
         self._communicator: Optional[OrchestratorCommunicator] = None
+        self._ask_user_callback = ask_user_callback
 
         # Context and memory
         self.context_loader = ContextLoader(workspace_root)
@@ -464,8 +493,8 @@ class TaskOrchestrator:
             "testing": 0,
         }
         self._max_planning_calls: int = 2
-        self._max_execution_calls: int = 3
-        self._max_testing_calls: int = 3
+        self._max_execution_calls: int = 5
+        self._max_testing_calls: int = 5
         if self.kernel:
             self._setup_decision_agent()
 
@@ -475,7 +504,16 @@ class TaskOrchestrator:
 
     def _setup_decision_agent(self) -> None:
         """Create and configure the internal AutonomousAgent for intelligent task routing."""
+        # Inject current date into system prompt
+        current_date_de = format_date_de()
+        current_date_iso = format_date_iso()
+
         system_prompt = f"""You are the Orbitron Orchestrator. You receive a user request and decide how to handle it.
+
+## CRITICAL: Current Date
+Today's date is **{current_date_de}** ({current_date_iso}).
+- When creating or reviewing documents, ensure dates use **{current_date_de}**, not any other date.
+- NEVER guess or assume a different date.
 
 ## Your Identity
 You are the central intelligence of the Orbitron agent system. You coordinate Planner, Executor, and Tester agents.
@@ -509,13 +547,29 @@ For **implementation tasks** (files, code, documents):
 - `request_planning` — Get a structured plan (call ONCE at most, BEFORE execution)
 - `request_execution` — Send task to Executor (call at most TWICE)
 - `request_testing` — Send product to Tester for quality review (call at most TWICE)
+- `ask_user` — Ask the user for clarification and wait for a response
 - `submit_result` — **TERMINAL** — Call this to finish and deliver the result
+
+## Calendar Tools
+You have access to Google Calendar tools to manage the user's schedule:
+- `calendar_list_upcoming` — List upcoming events (optional: max_results, time_min, time_max)
+- `calendar_get_events_for_date` — Get all events for a specific date (required: date in YYYY-MM-DD)
+- `calendar_search_events` — Search events by text (required: query)
+- `calendar_create_event` — Create a new event (required: summary, start_time, end_time; optional: description, location, timezone, attendees)
+- `calendar_update_event` — Update an existing event (required: event_id; optional: summary, start_time, end_time, description, location)
+- `calendar_delete_event` — Delete an event (required: event_id)
+- `calendar_quick_create` — Create event from natural language (required: text, e.g., "Meeting tomorrow at 3pm")
+- `calendar_get_free_busy` — Check free/busy times (optional: time_min, time_max)
+
+When the user asks about their schedule, appointments, or wants to create/modify calendar events, use these tools directly.
+Times should be in ISO 8601 format with timezone, e.g., "2026-05-22T10:00:00+02:00" for Berlin timezone.
 
 ## Decision Guidelines
 - **Simple question** → `answer_directly` → `submit_result`
 - **Simple implementation** → `request_execution` → `request_testing` → `submit_result`
 - **Complex project** → `request_planning` → `request_execution` → `request_testing` → `submit_result`
 - **If test fails** → `request_execution` (with fix instructions) → `request_testing` → `submit_result`
+- **If requirements are unclear** → `ask_user` → continue with planning/execution
 """
 
         self._decision_agent = AutonomousAgent(
@@ -570,6 +624,20 @@ For **implementation tasks** (files, code, documents):
         )
 
         self._decision_agent.register_tool(
+            name="ask_user",
+            description="Ask the user for clarification and wait for a reply before continuing.",
+            schema={
+                "type": "object",
+                "required": ["question"],
+                "properties": {
+                    "question": {"type": "string", "description": "The question to ask the user"},
+                    "context": {"type": "string", "description": "Optional context for the user"},
+                },
+            },
+            handler=self._tool_ask_user,
+        )
+
+        self._decision_agent.register_tool(
             name="submit_result",
             description="Submit the final result to the user. Call this when you are satisfied with the outcome.",
             schema={
@@ -598,6 +666,48 @@ For **implementation tasks** (files, code, documents):
             },
             handler=self._tool_request_testing,
         )
+
+        # ========== Calendar Tools ==========
+        # Register calendar tools from CalendarSkill
+        self._register_calendar_tools()
+
+    def _register_calendar_tools(self) -> None:
+        """Register Google Calendar tools with the decision agent.
+
+        Initializes the CalendarService and CalendarSkill, then registers
+        all calendar tool schemas and handlers with the autonomous agent.
+        """
+        try:
+            from OrbitronCalendar.calendar_skill import CalendarSkill
+            from OrbitronCalendar.calendar_service import CalendarService
+
+            self._calendar_service = CalendarService()
+            self._calendar_skill = CalendarSkill(self._calendar_service)
+
+            # Register each calendar tool with the decision agent
+            for tool_schema in self._calendar_skill.get_tools():
+                tool_name = tool_schema["function"]["name"]
+                handlers = self._calendar_skill.get_handlers()
+                handler = handlers.get(tool_name)
+                if handler:
+                    # Wrap the handler to return the result directly (handlers return JSON strings)
+                    self._decision_agent.register_tool(
+                        name=tool_name,
+                        description=tool_schema["function"]["description"],
+                        schema=tool_schema["function"]["parameters"],
+                        handler=handler,
+                    )
+                    logger.info("[Orchestrator] Registered calendar tool: %s", tool_name)
+
+            # Also register the calendar skill with the kernel for direct access
+            if self.kernel:
+                self.kernel.register_skill(self._calendar_skill)
+                logger.info("[Orchestrator] Registered calendar skill with kernel")
+
+            logger.info("[Orchestrator] Calendar tools registered (%d tools)", len(self._calendar_skill.get_tools()))
+        except Exception as e:
+            logger.warning("[Orchestrator] Failed to register calendar tools: %s", e)
+            logger.info("[Orchestrator] Continuing without calendar integration")
 
     # ========== Orchestrator Tool Handlers ==========
 
@@ -693,6 +803,25 @@ For **implementation tasks** (files, code, documents):
                 return {"ok": False, "error": "Invalid execution result"}
         except Exception as e:
             return {"ok": False, "error": str(e)}
+
+    def _tool_ask_user(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Tool handler: ask the user for clarification."""
+        question = args.get("question", "").strip()
+        context = args.get("context", "")
+        if context:
+            question = f"{question}\n\nContext: {context}" if question else context
+
+        task = self.get_active_task()
+        answer = self.ask_user(question=question, context=task.context if task else None)
+        if answer is None:
+            return {
+                "ok": False,
+                "error": "No user response received",
+                "waiting_for_user": True,
+                "question": question,
+            }
+
+        return {"ok": True, "answer": answer}
 
     def _tool_submit_result(self, args: dict[str, Any]) -> dict[str, Any]:
         """Tool handler: submit the final result."""
@@ -888,6 +1017,32 @@ For **implementation tasks** (files, code, documents):
             self._communicator = None
         
         logger.info("[TaskOrchestrator] Disconnected from message bus")
+
+    def set_user_interaction(
+        self,
+        ask_user_callback: Optional[Callable[[str, Optional[dict[str, Any]], int], Optional[str]]],
+    ) -> None:
+        """Set the callback used to ask the user for clarification."""
+        self._ask_user_callback = ask_user_callback
+
+    def ask_user(
+        self,
+        question: str,
+        context: Optional[dict[str, Any]] = None,
+        timeout_s: int = 300,
+    ) -> Optional[str]:
+        """Ask the user a clarification question and wait for a reply."""
+        if not question:
+            return None
+        if not self._ask_user_callback:
+            logger.warning("[TaskOrchestrator] ask_user requested but no callback is set")
+            return None
+
+        try:
+            return self._ask_user_callback(question, context or {}, timeout_s)
+        except TypeError:
+            # Backwards compatibility for callbacks without timeout
+            return self._ask_user_callback(question, context or {})
     
     def _build_system_context(self) -> str:
         """Build the complete system context for the LLM."""
@@ -1090,6 +1245,13 @@ Current Date: {datetime.now().strftime("%Y-%m-%d %H:%M")}
         # ===== PHASE 1: Planning (optional) =====
         if not skip_planning:
             planning_result = self._run_planning_loop(task)
+            if planning_result.get("waiting_for_user"):
+                return {
+                    "success": False,
+                    "waiting_for_user": True,
+                    "question": planning_result.get("question"),
+                    "task_id": task.task_id,
+                }
             if not planning_result["success"]:
                 logger.warning("[Pipeline] Planning failed, falling back to direct execution")
                 # Planning failed — try direct execution instead
@@ -1107,19 +1269,77 @@ Current Date: {datetime.now().strftime("%Y-%m-%d %H:%M")}
         self._execution_happened = True
         self._last_execution_result = execution_result
 
-        if not execution_result or not execution_result.get("success", False):
-            # First execution failed — try once more with error feedback
-            logger.warning("[Pipeline] First execution failed, retrying with error feedback")
-            fix_goal = self._build_error_fix_goal(task, execution_result)
-            execution_result = self._run_execution_adaptive(task, goal=fix_goal)
-            self._iteration_counts["execution"] += 1
-            self._last_execution_result = execution_result
+        if execution_result and isinstance(execution_result, dict) and (
+            execution_result.get("waiting_for_user") or execution_result.get("needs_user_input")
+        ):
+            logger.warning("[Pipeline] Execution requires user input, pausing task")
+            return {
+                "success": False,
+                "waiting_for_user": True,
+                "question": execution_result.get("question"),
+                "task_id": task.task_id,
+            }
 
-            if not execution_result or not execution_result.get("success", False):
-                # Both attempts failed — test what we have and submit
-                logger.warning("[Pipeline] Execution failed after retry, testing what we have")
-                test_result = self._run_testing_phase(task, execution_result)
-                return self._finalize_task(task, execution_result, test_result)
+        # Check if execution produced partial progress (files created even if success=False)
+        exec_artifacts = []
+        if execution_result and isinstance(execution_result, dict):
+            exec_artifacts = execution_result.get("artifacts", [])
+
+        if not execution_result or not execution_result.get("success", False):
+            # Execution reported failure — but check for partial progress
+            if exec_artifacts:
+                # Partial progress: files were created even though success=False
+                # This is common when the LLM marks success=False because the task
+                # isn't 100% complete, but meaningful work was done.
+                logger.info("[Pipeline] Execution reported failure but %d artifacts created — treating as partial success",
+                            len(exec_artifacts))
+                # Treat as success for pipeline flow — testing will validate quality
+                execution_result["success"] = True
+                execution_result["partial_progress"] = True
+                if not execution_result.get("notes"):
+                    execution_result["notes"] = f"Partial progress: {len(exec_artifacts)} file(s) created but task not fully complete"
+            else:
+                # No artifacts at all — genuine failure, retry
+                logger.warning("[Pipeline] First execution failed with no artifacts, retrying with error feedback")
+                fix_goal = self._build_error_fix_goal(task, execution_result)
+                execution_result = self._run_execution_adaptive(task, goal=fix_goal)
+                self._iteration_counts["execution"] += 1
+                self._last_execution_result = execution_result
+
+                # Check retry result for partial progress too
+                retry_artifacts = []
+                if execution_result and isinstance(execution_result, dict):
+                    retry_artifacts = execution_result.get("artifacts", [])
+
+                if not execution_result or not execution_result.get("success", False):
+                    if retry_artifacts:
+                        logger.info("[Pipeline] Retry produced %d artifacts — treating as partial success",
+                                    len(retry_artifacts))
+                        execution_result["success"] = True
+                        execution_result["partial_progress"] = True
+                    else:
+                        # Both attempts failed with no artifacts — still try testing
+                        # and fix cycle before giving up entirely
+                        logger.warning("[Pipeline] Execution failed after retry, testing what we have")
+                        test_result = self._run_testing_phase(task, execution_result)
+
+                        # If testing found issues, try a fix cycle before giving up
+                        if test_result and not test_result.get("passed", False):
+                            test_issues = test_result.get("issues", [])
+                            major_or_critical = [
+                                i for i in test_issues
+                                if isinstance(i, dict) and i.get("severity") in ("major", "critical")
+                            ]
+                            if major_or_critical and self._iteration_counts["execution"] < self._max_execution_calls:
+                                logger.info("[Pipeline] %d major/critical issues found after failed execution — attempting fix cycle",
+                                            len(major_or_critical))
+                                fix_goal = self._build_fix_goal(task, execution_result, test_result)
+                                execution_result = self._run_execution_adaptive(task, goal=fix_goal)
+                                self._iteration_counts["execution"] += 1
+                                self._last_execution_result = execution_result
+                                test_result = self._run_testing_phase(task, execution_result)
+
+                        return self._finalize_task(task, execution_result, test_result)
 
         # ===== PHASE 3: Testing (mandatory) =====
         test_result = self._run_testing_phase(task, execution_result)
@@ -1131,6 +1351,36 @@ Current Date: {datetime.now().strftime("%Y-%m-%d %H:%M")}
             logger.info("[Pipeline] Test found issues, attempting fix cycle (execution=%d/%d, testing=%d/%d)",
                         self._iteration_counts["execution"], self._max_execution_calls,
                         self._iteration_counts["testing"], self._max_testing_calls)
+
+            # Check if we should re-plan instead of just fixing
+            # Re-plan when: we've done 2+ fix cycles and still have critical issues,
+            # or when the task is large (many issues) and fixes aren't converging
+            major_or_critical = [
+                i for i in (test_result.get("issues", []) or [])
+                if isinstance(i, dict) and i.get("severity") in ("major", "critical")
+            ]
+            should_replan = (
+                self._iteration_counts["execution"] >= 2
+                and len(major_or_critical) >= 3
+                and self._iteration_counts["planning"] < self._max_planning_calls
+            )
+
+            if should_replan:
+                logger.info("[Pipeline] %d major/critical issues after %d fix cycles — re-planning with test feedback",
+                            len(major_or_critical), self._iteration_counts["execution"])
+                # Re-plan with the test feedback incorporated
+                planning_result = self._replan_with_feedback(task, execution_result, test_result)
+                if planning_result and planning_result.get("success"):
+                    # Reset execution for the new plan
+                    goal = self._convert_plan_to_goal(task.plan)
+                    execution_result = self._run_execution_adaptive(task, goal=goal, plan=task.plan)
+                    self._iteration_counts["execution"] += 1
+                    self._last_execution_result = execution_result
+                    test_result = self._run_testing_phase(task, execution_result)
+                    continue
+                else:
+                    logger.warning("[Pipeline] Re-planning failed, continuing with fix cycle")
+
             fix_goal = self._build_fix_goal(task, execution_result, test_result)
             execution_result = self._run_execution_adaptive(task, goal=fix_goal)
             self._iteration_counts["execution"] += 1
@@ -1138,6 +1388,19 @@ Current Date: {datetime.now().strftime("%Y-%m-%d %H:%M")}
 
             # Re-test after fix
             test_result = self._run_testing_phase(task, execution_result)
+
+        # ===== PHASE 5: Final attempt with re-planning if fix cycles exhausted =====
+        # If we've exhausted fix cycles but still have issues, try one more re-plan
+        if (test_result and not test_result.get("passed", False)
+                and self._iteration_counts["planning"] < self._max_planning_calls):
+            logger.info("[Pipeline] Fix cycles exhausted but task not complete — attempting final re-plan")
+            planning_result = self._replan_with_feedback(task, execution_result, test_result)
+            if planning_result and planning_result.get("success"):
+                goal = self._convert_plan_to_goal(task.plan)
+                execution_result = self._run_execution_adaptive(task, goal=goal, plan=task.plan)
+                self._iteration_counts["execution"] += 1
+                self._last_execution_result = execution_result
+                test_result = self._run_testing_phase(task, execution_result)
 
         # ===== PHASE 6: Finalize (always) =====
         return self._finalize_task(task, execution_result, test_result)
@@ -1255,6 +1518,85 @@ Current Date: {datetime.now().strftime("%Y-%m-%d %H:%M")}
 
         return "\n".join(goal_parts)
 
+    def _replan_with_feedback(
+        self,
+        task: Task,
+        execution_result: Optional[dict[str, Any]],
+        test_result: Optional[dict[str, Any]],
+    ) -> Optional[dict[str, Any]]:
+        """Re-plan a task using feedback from execution and testing.
+
+        This is called when fix cycles aren't converging — instead of just
+        fixing individual issues, we go back to planning with the full context
+        of what went wrong and what's already been created.
+
+        Args:
+            task: The original task
+            execution_result: Result from the last execution
+            test_result: Result from the last test
+
+        Returns:
+            Planning result dict, or None if planning fails
+        """
+        logger.info("[Pipeline] Re-planning task with execution and test feedback")
+
+        # Build context about what's been done and what's still needed
+        context_parts = [f"ORIGINAL TASK: {task.description}"]
+
+        # Add execution context
+        if execution_result and isinstance(execution_result, dict):
+            artifacts = execution_result.get("artifacts", [])
+            summary = execution_result.get("summary", "")
+            if artifacts:
+                context_parts.append(f"\nFILES ALREADY CREATED: {', '.join(str(a) for a in artifacts[:20])}")
+            if summary:
+                context_parts.append(f"\nEXECUTION SUMMARY: {summary[:500]}")
+
+        # Add test feedback
+        if test_result and isinstance(test_result, dict):
+            issues = test_result.get("issues", [])
+            quality = test_result.get("quality_rating", "unknown")
+            summary = test_result.get("summary", "")
+            recommendations = test_result.get("recommendations", "")
+
+            context_parts.append(f"\nTEST RESULT: quality={quality}, passed={test_result.get('passed', False)}")
+            if summary:
+                context_parts.append(f"TEST SUMMARY: {summary[:500]}")
+
+            if issues:
+                context_parts.append("\nREMAINING ISSUES:")
+                for i, issue in enumerate(issues[:10], 1):
+                    if isinstance(issue, dict):
+                        severity = issue.get("severity", "unknown")
+                        desc = issue.get("description", str(issue))
+                        context_parts.append(f"  {i}. [{severity.upper()}] {desc}")
+                    else:
+                        context_parts.append(f"  {i}. {issue}")
+
+            if recommendations:
+                context_parts.append(f"\nRECOMMENDATIONS: {recommendations[:500]}")
+
+        context_parts.append("\nCreate a NEW plan that addresses the remaining issues. Focus on what's MISSING, not what's already done.")
+
+        # Create a new task description with the feedback context
+        new_description = "\n".join(context_parts)
+
+        # Run the planner with the enriched context
+        self._iteration_counts["planning"] += 1
+
+        try:
+            planning_result = self._run_planning_loop(task, enriched_description=new_description)
+            if planning_result and planning_result.get("success"):
+                logger.info("[Pipeline] Re-planning succeeded — new plan with %d steps",
+                            len(task.plan.get("steps", [])) if task.plan else 0)
+                return planning_result
+            else:
+                logger.warning("[Pipeline] Re-planning did not produce a valid plan")
+                return None
+        except Exception as e:
+            logger.error("[Pipeline] Re-planning failed with exception: %s", e)
+            return None
+
     def _finalize_task(
         self,
         task: Task,
@@ -1285,6 +1627,8 @@ Current Date: {datetime.now().strftime("%Y-%m-%d %H:%M")}
             if exec_summary:
                 summary_parts.append(exec_summary[:500])
             artifacts = execution_result.get("artifacts", [])
+            # Check for partial progress — if files were created, that's meaningful work
+            partial_progress = execution_result.get("partial_progress", False)
 
         if test_result and isinstance(test_result, dict):
             test_passed = test_result.get("passed", False)
@@ -1303,20 +1647,35 @@ Current Date: {datetime.now().strftime("%Y-%m-%d %H:%M")}
             ]
 
             if major_or_critical:
-                # Major/critical issues found — always mark as failed
-                success = False
-                logger.warning(
-                    "[Pipeline] %d major/critical issue(s) found — marking task as failed (quality=%s)",
-                    len(major_or_critical), quality,
-                )
+                # Major/critical issues found — but check if we have artifacts (partial progress)
+                if artifacts:
+                    # We have created files — this is meaningful progress, not a total failure
+                    # Mark as not fully successful but acknowledge the work done
+                    success = False  # Still mark as not fully successful
+                    logger.warning(
+                        "[Pipeline] %d major/critical issue(s) found but %d artifacts created — partial progress (quality=%s)",
+                        len(major_or_critical), len(artifacts), quality,
+                    )
+                else:
+                    success = False
+                    logger.warning(
+                        "[Pipeline] %d major/critical issue(s) found — marking task as failed (quality=%s)",
+                        len(major_or_critical), quality,
+                    )
             elif test_passed and quality in ("excellent", "good"):
                 success = True
             elif test_passed:
                 success = True  # Acceptable quality
             else:
-                # Tests failed — override success to False regardless of execution result
-                success = False
-                logger.warning("[Pipeline] Tests FAILED (quality=%s) — marking task as failed", quality)
+                # Tests failed — but check for partial progress
+                if partial_progress and artifacts:
+                    # Partial progress — files were created, tests found issues
+                    success = False  # Not fully successful, but not a total loss
+                    logger.warning("[Pipeline] Tests FAILED (quality=%s) but %d artifacts created — partial progress",
+                                   quality, len(artifacts))
+                else:
+                    success = False
+                    logger.warning("[Pipeline] Tests FAILED (quality=%s) — marking task as failed", quality)
 
         # Mark task as completed or failed
         if success:
@@ -1326,8 +1685,18 @@ Current Date: {datetime.now().strftime("%Y-%m-%d %H:%M")}
                 "artifacts": artifacts,
                 "test_issues": test_issues,
             })
+        elif artifacts:
+            # Partial progress — files were created but task not fully successful
+            # Mark as completed (not failed) so the user gets a proper response with artifacts
+            task.set_completed({
+                "summary": "\n".join(summary_parts),
+                "success": False,
+                "artifacts": artifacts,
+                "test_issues": test_issues,
+                "partial_progress": True,
+            })
         else:
-            # Even if we failed, we still submit a result
+            # Complete failure — no artifacts created
             error_msg = (execution_result.get("error") or "Task could not be completed") if execution_result else "No execution result"
             if test_issues:
                 error_msg += f" | Test issues: {len(test_issues)} found"
@@ -1335,11 +1704,20 @@ Current Date: {datetime.now().strftime("%Y-%m-%d %H:%M")}
 
         # Reflect on the task outcome
         duration = (datetime.now() - task.created_at).total_seconds() if task.created_at else 0
-        self.reflection_engine.reflect_on_task(
+        reflection = self.reflection_engine.reflect_on_task(
             task_id=task.task_id,
             result={"success": success, "artifacts": artifacts, "test_issues": test_issues},
             duration_seconds=duration,
         )
+
+        # Periodically update USER.md with learned preferences (every 5 reflections)
+        total_reflections = len(self.reflection_engine._reflections)
+        if total_reflections > 0 and total_reflections % 5 == 0:
+            try:
+                self.reflection_engine.update_user_profile()
+                logger.info("[Pipeline] Updated USER.md with learned preferences (reflection #%d)", total_reflections)
+            except Exception as e:
+                logger.warning("[Pipeline] Failed to update USER.md: %s", e)
 
         result = {
             "success": success,
@@ -1372,17 +1750,132 @@ Current Date: {datetime.now().strftime("%Y-%m-%d %H:%M")}
     def _classify_task(self, task: Task) -> str:
         """Classify a task into one of four types for adaptive routing.
 
+        Uses keyword pre-checks first, then LLM classification, with heuristic fallback.
+
         Types:
         - question: Simple question that doesn't need planning/execution
         - direct_execution: Simple file creation or modification, skip planning
         - exploratory: Needs codebase exploration before planning
         - complex: Full pipeline with planning, execution, and validation
-
-        Uses heuristics first, then optional LLM confirmation.
         """
-        description = task.description.lower()
+        # Pre-check: Calendar-related requests must be direct_execution
+        # The LLM often misclassifies these as "question" because they contain
+        # question words, but they need the calendar tools which are only
+        # available in the execution pipeline.
+        description_lower = task.description.lower()
+        calendar_keywords = [
+            "kalender", "calendar", "termin", "appointment", "event",
+            "schaue in google calendar", "google calendar",
+            "termine für", "events for", "habe ich einen termin",
+            "welchen termin", "meine termine", "was steht an",
+            "welche termine", "habe ich heute", "habe ich morgen",
+        ]
+        if any(kw in description_lower for kw in calendar_keywords):
+            logger.info("[Orchestrator] Calendar-related request detected, classifying as direct_execution: %s", task.description[:80])
+            return "direct_execution"
 
-        # Heuristic shortcuts
+        # Try LLM-based classification
+        classification = self._llm_classify_task(task.description)
+        if classification:
+            logger.info("[Orchestrator] LLM classified task as: %s", classification)
+            return classification
+
+        # Fallback: heuristic classification
+        logger.info("[Orchestrator] LLM classification failed, using heuristics")
+        return self._heuristic_classify_task(task.description)
+
+    def _llm_classify_task(self, description: str) -> Optional[str]:
+        """Use the LLM to classify a task.
+
+        Returns one of: "question", "direct_execution", "exploratory", "complex"
+        Returns None if classification fails.
+        """
+        if not self.kernel:
+            return None
+
+        try:
+            classification_prompt = (
+                "You are a task classifier for an AI agent system. "
+                "Classify the following user request into exactly ONE of these categories:\n\n"
+                '- "question": Simple questions that just need an answer. No files need to be created or modified. '
+                'Examples: "what is X", "explain Y", "how does Z work", "welche dateien sind im ordner xy", '
+                '"was ist eine list comprehension"\n\n'
+                '- "direct_execution": Simple, single-step file operations. Creating one file, making a small fix, '
+                'writing a simple script. No planning needed — just execute directly. '
+                'Examples: "create a file X with content Y", "fix the bug in Z", "write a simple script that does W"\n\n'
+                '- "exploratory": Tasks that need to explore existing code before making changes. '
+                'Modifying existing projects, refactoring, adding features to existing code. '
+                'Examples: "add feature X to the existing app", "refactor the Y module", "update the Z component"\n\n'
+                '- "complex": Multi-step tasks requiring planning, multiple files, or architectural decisions. '
+                'Building new features, creating apps, systems with multiple components. '
+                'Examples: "build a web app", "create a complete API", "implement a full authentication system"\n\n'
+                "IMPORTANT: Respond with ONLY the category name, nothing else. No explanation, no quotes, no extra text.\n\n"
+                f"User request: {description}"
+            )
+
+            messages = [
+                {"role": "system", "content": "You are a precise task classifier. Respond with exactly one word from: question, direct_execution, exploratory, complex"},
+                {"role": "user", "content": classification_prompt},
+            ]
+
+            response = self.kernel.ollama.chat(
+                messages=messages,
+                stream=False,
+                timeout_s=30,
+                max_retries=1,
+            )
+
+            content = str((response.get("message") or {}).get("content") or "").strip().lower()
+
+            # Parse the classification from the response
+            valid_types = {"question", "direct_execution", "exploratory", "complex"}
+
+            # Direct match
+            if content in valid_types:
+                return content
+
+            # Try to extract from longer response
+            for task_type in valid_types:
+                if task_type in content:
+                    return task_type
+
+            # Try JSON parsing in case the LLM wrapped it
+            try:
+                parsed = json.loads(content)
+                if isinstance(parsed, str) and parsed in valid_types:
+                    return parsed
+                if isinstance(parsed, dict) and "type" in parsed:
+                    if parsed["type"] in valid_types:
+                        return parsed["type"]
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+            logger.warning("[Orchestrator] Could not parse LLM classification: %s", content[:100])
+            return None
+
+        except Exception as e:
+            logger.warning("[Orchestrator] LLM classification error: %s", e)
+            return None
+
+    def _heuristic_classify_task(self, description: str) -> str:
+        """Heuristic task classification as fallback when LLM is unavailable.
+
+        Uses pattern matching to classify tasks into:
+        - question, direct_execution, exploratory, complex
+        """
+        description_lower = description.lower()
+
+        # Calendar-related requests → direct_execution (Orchestrator has calendar tools)
+        calendar_keywords = [
+            "kalender", "calendar", "termin", "appointment", "event",
+            "schaue in google calendar", "google calendar",
+            "termine für", "events for", "habe ich einen termin",
+            "welchen termin", "meine termine", "was steht an",
+        ]
+        if any(kw in description_lower for kw in calendar_keywords):
+            return "direct_execution"
+
+        # Question patterns (English + German)
         question_patterns = [
             r"^what\s",
             r"^how\s",
@@ -1401,22 +1894,21 @@ Current Date: {datetime.now().strftime("%Y-%m-%d %H:%M")}
             r"^wer\s",
             r"\?$",
         ]
-        if any(re.search(p, description) for p in question_patterns):
+        if any(re.search(p, description_lower) for p in question_patterns):
             return "question"
 
-        # Complex task patterns (English + German) — checked BEFORE simple patterns
-        # Multi-step tasks that need planning should not be classified as "simple"
+        # Complex task patterns (English + German)
         complex_indicators = [
             r"(build|create|develop|erstell|entwickl)\w*\s+a?\s*(full|complete|complex|vollständig|komplett)",
             r"(website|app|application|system|api|service|webseite|anwendung)",
             r"(multiple|several|mehrere)\s+(files|pages|components|dateien|seiten|komponenten)",
             r"(frontend|backend|database|auth|authentication|datenbank|authentifizierung)",
             r"(implement|integrate|architecture|design|implementier|integrier|architektur)",
-            r"(ordner|folder|directory|verzeichnis)\s+.*(und|and|mit|with|darin|darinnen)",  # "create folder with X inside"
-            r"(welcome\s*page|landing\s*page|homepage|startseite)",  # multi-file deliverables
-            r"\bund\b.*\b(darin|dorthin|inside|in\s+(?:the|dem|der))\b",  # "X and Y in it"
+            r"(ordner|folder|directory|verzeichnis)\s+.*(und|and|mit|with|darin|darinnen)",
+            r"(welcome\s*page|landing\s*page|homepage|startseite)",
+            r"\bund\b.*\b(darin|dorthin|inside|in\s+(?:the|dem|der))\b",
         ]
-        if any(re.search(p, description) for p in complex_indicators):
+        if any(re.search(p, description_lower) for p in complex_indicators):
             return "complex"
 
         # Simple file creation patterns (English + German)
@@ -1432,17 +1924,16 @@ Current Date: {datetime.now().strftime("%Y-%m-%d %H:%M")}
             r"^generier\w*\s+",
             r"^mach\w*\s+",
         ]
-        if any(re.search(p, description) for p in simple_patterns):
-            # Check if it references existing codebase
-            if any(kw in description for kw in ["existing", "current", "project", "module", "refactor", "fix", "update", "modify", "bestehend", "aktuell", "aktualisier", "änder", "fix"]):
+        if any(re.search(p, description_lower) for p in simple_patterns):
+            if any(kw in description_lower for kw in ["existing", "current", "project", "module", "refactor", "fix", "update", "modify", "bestehend", "aktuell", "aktualisier", "änder", "fix"]):
                 return "exploratory"
             return "direct_execution"
 
-        # Default: if it references existing code, exploratory; otherwise complex
-        if any(kw in description for kw in ["existing", "current", "project", "module", "refactor", "fix", "update", "modify", "add to", "integrate with", "bestehend", "aktuell", "projekt", "aktualisier", "änder", "fix", "erweiter"]):
+        # References to existing code → exploratory
+        if any(kw in description_lower for kw in ["existing", "current", "project", "module", "refactor", "fix", "update", "modify", "add to", "integrate with", "bestehend", "aktuell", "projekt", "aktualisier", "änder", "fix", "erweiter"]):
             return "exploratory"
 
-        # Anything else that didn't match simple patterns is likely complex enough to plan
+        # Default: complex
         return "complex"
 
     def _handle_question_task(self, task: Task) -> dict[str, Any]:
@@ -1530,6 +2021,7 @@ Current Date: {datetime.now().strftime("%Y-%m-%d %H:%M")}
         task: Task,
         goal: str,
         plan: Optional[dict[str, Any]] = None,
+        allow_user_clarification: bool = True,
     ) -> dict[str, Any]:
         """Execute a goal using the Executor Agent (adaptive mode).
 
@@ -1575,6 +2067,27 @@ Current Date: {datetime.now().strftime("%Y-%m-%d %H:%M")}
                         if result.get("error") and not execution_result.get("error"):
                             execution_result["error"] = result.get("error")
                         result = execution_result
+
+                if isinstance(result, dict) and result.get("needs_user_input"):
+                    if allow_user_clarification:
+                        question = str(result.get("question") or "Please clarify the requirement.")
+                        answer = self.ask_user(question, task.context)
+                        if answer:
+                            updated_goal = f"{goal}\n\nUser clarification: {answer}"
+                            return self._run_execution_adaptive(
+                                task,
+                                goal=updated_goal,
+                                plan=plan,
+                                allow_user_clarification=False,
+                            )
+                    task.set_waiting_for_user(question if 'question' in locals() else str(result.get("question") or ""))
+                    return {
+                        "success": False,
+                        "error": "User clarification required",
+                        "needs_user_input": True,
+                        "waiting_for_user": True,
+                        "question": result.get("question"),
+                    }
 
                 logger.info("[Execution] Adaptive execution completed")
                 return result
@@ -1791,57 +2304,72 @@ Current Date: {datetime.now().strftime("%Y-%m-%d %H:%M")}
             )
             return {"success": False, "error": error_msg}
     
-    def _run_planning_loop(self, task: Task) -> dict[str, Any]:
+    def _run_planning_loop(self, task: Task, enriched_description: Optional[str] = None) -> dict[str, Any]:
         """Run the planning loop until plan is approved or max iterations reached.
         
         Args:
             task: Task to plan for
+            enriched_description: Optional enriched description with feedback context
             
         Returns:
             Result dictionary with success status
         """
         logger.info("[Planning Loop] Starting for task: %s", task.task_id)
         
-        while True:
-            # Check iteration limit
-            if task.current_planning_iteration >= task.max_planning_iterations:
-                if task.status == TaskStatus.PLAN_REVISION:
-                    # Max iterations reached with pending revision
-                    error_msg = f"Maximum planning iterations ({task.max_planning_iterations}) reached. Plan not approved."
-                    task.set_failed(error_msg)
-                    return {"success": False, "error": error_msg}
-                break
-            
-            # Request planning from Planner
-            planning_result = self._request_planning(task)
-            if not planning_result["success"]:
-                return planning_result
-            
-            # Review the plan
-            review_result = self._review_plan(task)
-            
-            if review_result == PlanReviewResult.APPROVED:
-                logger.info("[Planning Loop] Plan approved after %d iteration(s)", task.current_planning_iteration)
-                return {"success": True}
-            
-            elif review_result == PlanReviewResult.REJECTED:
-                # Task failed
-                return {"success": False, "error": task.error_message}
-            
-            elif review_result == PlanReviewResult.NEEDS_REVISION:
-                if not task.can_request_revision():
-                    # This was the last iteration
-                    error_msg = f"Plan needs revision but max iterations ({task.max_planning_iterations}) reached."
-                    task.set_failed(error_msg)
-                    return {"success": False, "error": error_msg}
-                
-                logger.info("[Planning Loop] Requesting revision (iteration %d)", task.current_planning_iteration + 1)
-                # Continue loop for revision
-                continue
+        # If we have an enriched description, update the task description for planning
+        if enriched_description:
+            # Store the original description and temporarily use the enriched one
+            original_description = task.description
+            task.description = enriched_description
+            logger.info("[Planning Loop] Using enriched description with feedback context")
         
-        return {"success": True}
+        try:
+            while True:
+                # Check iteration limit
+                if task.current_planning_iteration >= task.max_planning_iterations:
+                    if task.status == TaskStatus.PLAN_REVISION:
+                        # Max iterations reached with pending revision
+                        error_msg = f"Maximum planning iterations ({task.max_planning_iterations}) reached. Plan not approved."
+                        task.set_failed(error_msg)
+                        return {"success": False, "error": error_msg}
+                    break
+                
+                # Request planning from Planner
+                planning_result = self._request_planning(task)
+                if planning_result.get("waiting_for_user"):
+                    return planning_result
+                if not planning_result["success"]:
+                    return planning_result
+                
+                # Review the plan
+                review_result = self._review_plan(task)
+                
+                if review_result == PlanReviewResult.APPROVED:
+                    logger.info("[Planning Loop] Plan approved after %d iteration(s)", task.current_planning_iteration)
+                    return {"success": True}
+                
+                elif review_result == PlanReviewResult.REJECTED:
+                    # Task failed
+                    return {"success": False, "error": task.error_message}
+                
+                elif review_result == PlanReviewResult.NEEDS_REVISION:
+                    if not task.can_request_revision():
+                        # This was the last iteration
+                        error_msg = f"Plan needs revision but max iterations ({task.max_planning_iterations}) reached."
+                        task.set_failed(error_msg)
+                        return {"success": False, "error": error_msg}
+                    
+                    logger.info("[Planning Loop] Requesting revision (iteration %d)", task.current_planning_iteration + 1)
+                    # Continue loop for revision
+                    continue
+            
+            return {"success": True}
+        finally:
+            # Restore original description if we changed it
+            if enriched_description:
+                task.description = original_description
     
-    def _request_planning(self, task: Task) -> dict[str, Any]:
+    def _request_planning(self, task: Task, allow_user_clarification: bool = True) -> dict[str, Any]:
         """Request planning from the Planner Agent.
         
         Args:
@@ -1878,8 +2406,32 @@ Current Date: {datetime.now().strftime("%Y-%m-%d %H:%M")}
                 result = self._call_planner_directly(task)
             
             if result["success"]:
-                plan = result.get("plan", {})
-                analysis = result.get("analysis", {})
+                plan = result.get("plan", {}) or {}
+                analysis = result.get("analysis", {}) or {}
+
+                if isinstance(plan, dict) and plan.get("needs_user_input"):
+                    if not allow_user_clarification:
+                        error_msg = "Planner requested user input repeatedly"
+                        task.set_failed(error_msg)
+                        return {"success": False, "error": error_msg}
+
+                    question = str(plan.get("question") or "Please clarify the requirement.")
+                    answer = self.ask_user(question, task.context)
+                    if not answer:
+                        task.set_waiting_for_user(question)
+                        return {
+                            "success": False,
+                            "waiting_for_user": True,
+                            "question": question,
+                        }
+
+                    task.context.setdefault("user_clarifications", []).append({
+                        "question": question,
+                        "answer": answer,
+                    })
+                    task.description = f"{task.description}\n\nUser clarification: {answer}"
+                    return self._request_planning(task, allow_user_clarification=False)
+
                 self._iteration_counts["planning"] += 1
                 logger.info("[Orchestrator] Planning response received - plan_id=%s title='%s' steps=%d",
                              plan.get("id", "unknown"), plan.get("title", "N/A")[:50], 
@@ -2964,6 +3516,7 @@ def create_orchestrator(
     max_planning_iterations: int = 3,
     planning_timeout_seconds: int = 900,
     execution_timeout_seconds: int = 900,
+    ask_user_callback: Optional[Callable[[str, Optional[dict[str, Any]], int], Optional[str]]] = None,
 ) -> TaskOrchestrator:
     """Create and initialize a TaskOrchestrator instance."""
     return TaskOrchestrator(
@@ -2972,6 +3525,7 @@ def create_orchestrator(
         max_planning_iterations=max_planning_iterations,
         planning_timeout_seconds=planning_timeout_seconds,
         execution_timeout_seconds=execution_timeout_seconds,
+        ask_user_callback=ask_user_callback,
     )
 
 

@@ -19,6 +19,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
+from OrbitronUtils.dates import months_de, format_date_de, format_date_iso
+
 # Import kernel components
 from OrbitronKernel.kernel import AgentSkill
 
@@ -275,7 +277,16 @@ class PlannerAgent:
 
     def _setup_autonomous_agent(self) -> None:
         """Create and configure the AutonomousAgent instance."""
+        # Inject current date into system prompt
+        current_date_de = format_date_de()
+        current_date_iso = format_date_iso()
+
         system_prompt = f"""You are the Orbitron Planner Agent. You receive a task and create a CONCISE, FOCUSED plan for its implementation.
+
+## CRITICAL: Current Date
+Today's date is **{current_date_de}** ({current_date_iso}).
+- When planning documents or content that includes dates, ALWAYS use **{current_date_de}** as the current date.
+- NEVER guess or assume a different date. If a plan involves dates, specify the correct date.
 
 ## Your Identity
 You are the system's strategist. You create MINIMAL, ACTIONABLE plans.
@@ -450,6 +461,33 @@ Your plan MUST follow this JSON schema:
             "question": args.get("question", ""),
         }
 
+    def _extract_question_from_loop(self, loop_result: AgentLoopResult) -> str:
+        """Extract a question string from an ask_question terminal result."""
+        if not loop_result:
+            return ""
+
+        terminal = loop_result.metadata.get("terminal_result", {}) if hasattr(loop_result, "metadata") else {}
+        if isinstance(terminal, dict):
+            result = terminal.get("result")
+            if isinstance(result, dict):
+                question = result.get("question")
+                if isinstance(question, str) and question.strip():
+                    return question.strip()
+
+        # Fallback: try to parse JSON content
+        try:
+            payload = json.loads(loop_result.content or "")
+            if isinstance(payload, dict):
+                inner = payload.get("result", payload)
+                if isinstance(inner, dict):
+                    question = inner.get("question")
+                    if isinstance(question, str):
+                        return question.strip()
+        except Exception:
+            pass
+
+        return ""
+
     # ========== Autonomous Planning ==========
 
     def plan_autonomously(
@@ -507,6 +545,20 @@ Your plan MUST follow this JSON schema:
             context=planning_context if planning_context != context else planning_context,
             max_rounds=self.max_rounds,
         )
+
+        if loop_result.terminal_tool == "ask_question":
+            question = self._extract_question_from_loop(loop_result)
+            return {
+                "plan": {
+                    "needs_user_input": True,
+                    "question": question or "Please clarify the requirement.",
+                },
+                "metadata": {
+                    "source": "ask_question",
+                    "rounds": loop_result.rounds_used,
+                    "tool_calls": loop_result.tool_calls_made,
+                },
+            }
 
         if self._submitted_plan:
             self._logger.info("[Planner] Plan submitted successfully via autonomous loop")
@@ -672,7 +724,16 @@ Your plan MUST follow this JSON schema:
 
     def _build_planning_messages(self, request: str, context: dict[str, Any]) -> list[dict[str, Any]]:
         """Build messages for LLM planning with strict JSON output."""
+        # Inject current date
+        current_date_de = format_date_de()
+        current_date_iso = format_date_iso()
+
         system_prompt = f"""You are the Orbitron Planner Agent. Your role is to think strategically and create structured plans.
+
+## CRITICAL: Current Date
+Today's date is **{current_date_de}** ({current_date_iso}).
+- When planning documents or content that includes dates, ALWAYS use **{current_date_de}** as the current date.
+- NEVER guess or assume a different date.
 
 ## Your Identity
 You are the system's strategist and architect. You analyze, decompose, and structure tasks.

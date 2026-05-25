@@ -1,3 +1,19 @@
-pypandoc>=1.14
-playwright>=1.40.0
+# Core dependencies
 requests>=2.28.0
+PyJWT>=2.8.0
+pypandoc>=1.14
+python-docx>=0.8.11
+
+# Testing
+pytest>=7.4.0
+pytest-cov>=4.1.0
+
+# Optional: Telegram Bot
+# python-telegram-bot>=20.0
+
+# Optional: Google Calendar
+# google-auth-oauthlib>=1.0.0
+# google-api-python-client>=2.0.0
+
+# Optional: Browser Testing
+# playwright>=1.40.0

@@ -53,7 +53,10 @@ class MessageHandler:
             return False
         
         # Check priority filter
-        if self.priority_filter and message.header.priority.value < self.priority_filter.value:
+        # Priority values: CRITICAL=0, HIGH=1, NORMAL=2, LOW=3
+        # Lower value = higher priority. Filter means "only handle messages with
+        # priority at least as high as the filter" (i.e., value <= filter value)
+        if self.priority_filter and message.header.priority.value > self.priority_filter.value:
             return False
         
         return True
@@ -89,6 +92,10 @@ class MessageBus:
         # Request/response tracking (thread-safe)
         self._pending_requests: dict[str, dict[str, Any]] = {}
         self._response_handlers: dict[str, Callable[[Message], None]] = {}
+        
+        # Dead-letter queue for undeliverable messages
+        self._dead_letters: list[dict[str, Any]] = []
+        self._max_dead_letters = 100  # Keep last 100 undeliverable messages
         
         # Statistics
         self._stats = {
@@ -133,8 +140,14 @@ class MessageBus:
                 self._stats["errors"] += 1
     
     def _deliver_message(self, message: Message) -> None:
-        """Deliver a message to all appropriate handlers."""
+        """Deliver a message to all appropriate handlers.
+        
+        Includes broadcast loop protection: when broadcasting, the sender's
+        own handler is excluded to prevent infinite loops.
+        Includes dead-letter tracking for undeliverable messages.
+        """
         delivered = False
+        sender_id = f"{message.header.sender_role.value}:{message.header.sender}" if message.header.sender_role and message.header.sender else None
         
         # Try specific recipient first
         if message.header.recipient and message.header.recipient in self._handlers:
@@ -148,13 +161,19 @@ class MessageBus:
             for handler_id in self._role_handlers.get(message.header.recipient_role, set()):
                 if handler_id in self._handlers:
                     handler = self._handlers[handler_id]
+                    # Skip sender to prevent broadcast loops
+                    if handler_id == sender_id:
+                        continue
                     if handler.should_handle(message):
                         handler.handle(message)
                         delivered = True
         
         # Broadcast only when no recipient is specified
         if message.header.recipient is None and message.header.recipient_role is None:
-            for handler in self._handlers.values():
+            for handler_id, handler in self._handlers.items():
+                # Skip sender to prevent broadcast loops
+                if handler_id == sender_id:
+                    continue
                 if handler.should_handle(message):
                     handler.handle(message)
                     delivered = True
@@ -178,10 +197,32 @@ class MessageBus:
             self._stats["messages_delivered"] += 1
         else:
             self._stats["messages_dropped"] += 1
+            # Add to dead-letter queue for debugging
+            self._add_dead_letter(message, "no_handler")
         
         # Persist if enabled
         if self._persistence_dir:
             self._persist_message(message)
+    
+    def _add_dead_letter(self, message: Message, reason: str) -> None:
+        """Add an undeliverable message to the dead-letter queue."""
+        entry = {
+            "message_id": message.header.message_id,
+            "sender": message.header.sender,
+            "sender_role": message.header.sender_role.value if message.header.sender_role else None,
+            "recipient": message.header.recipient,
+            "recipient_role": message.header.recipient_role.value if message.header.recipient_role else None,
+            "message_type": message.header.message_type.name,
+            "reason": reason,
+            "timestamp": datetime.now().isoformat(),
+            "payload_keys": list(message.payload.keys()) if message.payload else [],
+        }
+        self._dead_letters.append(entry)
+        # Trim to max size
+        if len(self._dead_letters) > self._max_dead_letters:
+            self._dead_letters = self._dead_letters[-self._max_dead_letters:]
+        logger.warning("[MessageBus] Dead letter: %s -> %s (reason: %s)", 
+                       message.header.sender, message.header.recipient or "broadcast", reason)
     
     def _persist_message(self, message: Message) -> None:
         """Persist message to disk with size limits."""
@@ -402,7 +443,19 @@ class MessageBus:
             "handlers_registered": len(self._handlers),
             "pending_requests": len(self._pending_requests),
             "queue_size": self._message_queue.qsize(),
+            "dead_letters": len(self._dead_letters),
         }
+    
+    def get_dead_letters(self, limit: int = 20) -> list[dict[str, Any]]:
+        """Get recent dead-letter messages (undeliverable messages).
+        
+        Args:
+            limit: Maximum number of dead letters to return
+            
+        Returns:
+            List of dead-letter entries with message metadata
+        """
+        return self._dead_letters[-limit:]
     
     def get_handlers(self) -> list[dict[str, Any]]:
         """Get information about registered handlers."""

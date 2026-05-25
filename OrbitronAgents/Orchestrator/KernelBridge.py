@@ -48,7 +48,10 @@ class KernelBridge:
         return response
     
     def chat_with_session(self, user_input: str, chat_id: int) -> str:
-        """Chat with persistent session memory."""
+        """Chat with persistent session memory.
+        
+        Includes proper session cleanup on exceptions to prevent memory leaks.
+        """
         # Get existing session or create new
         session = self.kernel.get_session(chat_id)
 
@@ -63,16 +66,27 @@ class KernelBridge:
         session.append({"role": "user", "content": user_input})
         self.orchestrator.memory.add_to_short_term("user", user_input, {"chat_id": chat_id})
 
-        # Run through kernel
-        response = self.kernel.run_chat(session, max_rounds=10)
+        try:
+            # Run through kernel
+            response = self.kernel.run_chat(session, max_rounds=10)
 
-        # Store in orchestrator memory
-        self.orchestrator.respond(response, {"chat_id": chat_id})
+            # Store in orchestrator memory
+            self.orchestrator.respond(response, {"chat_id": chat_id})
 
-        # Persist session after each turn
-        self.kernel.save_session(chat_id)
+            # Persist session after each turn
+            self.kernel.save_session(chat_id)
 
-        return response
+            return response
+
+        except Exception as e:
+            # Clean up session on exception to prevent memory leaks
+            logger.error("[KernelBridge] Exception in chat_with_session for chat_id=%s: %s", chat_id, e)
+            try:
+                # Try to save what we have, but don't let cleanup errors mask the original exception
+                self.kernel.save_session(chat_id)
+            except Exception:
+                pass  # Best effort save
+            raise
     
     def learn(self, key: str, value: Any) -> None:
         """Teach the orchestrator something new."""

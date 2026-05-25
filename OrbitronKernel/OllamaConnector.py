@@ -319,6 +319,7 @@ class OllamaConnector:
                 obj = json.loads(line)
                 saw_json = True
             except json.JSONDecodeError:
+                logger.warning("[Ollama] Skipping non-JSON line in stream: %.100s", line[:100])
                 continue
 
             raw_last_obj = obj
@@ -352,8 +353,13 @@ class OllamaConnector:
         if not saw_json:
             try:
                 raw_last_obj = response.json()
-            except Exception:
-                return {"message": aggregated_message, "done": True}
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.error("[Ollama] Failed to parse response as JSON: %s", e)
+                # Return a minimal valid response instead of crashing
+                return {"message": aggregated_message, "done": True, "error": f"JSON parse error: {e}"}
+            except Exception as e:
+                logger.error("[Ollama] Unexpected error parsing response: %s", e)
+                return {"message": aggregated_message, "done": True, "error": f"Response parse error: {e}"}
 
         result: dict[str, Any] = dict(raw_last_obj or {})
 

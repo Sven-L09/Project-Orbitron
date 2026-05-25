@@ -1,17 +1,54 @@
+# Environment variables (contains secrets!)
 .env
+.env.*
+!.env.example
+
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+eggs/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
 
 # Local runtime data
 .orbitron/
-
-# Virtual environment
-.venv/
-venv/
+logs/
+*.log
 
 # Binary packages
 *.deb
 
 # IDE settings
 .vscode/
+.idea/
 .claude/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Google Calendar credentials
+*credentials*.json
+*service-account*.json
+client_secret*.json
+
+# Temporary files
+*.tmp
+*.bak

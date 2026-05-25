@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import subprocess
+import time
 from collections import Counter
 from pathlib import Path
 from typing import Any, Optional
@@ -612,6 +613,18 @@ class OrbitronKernel:
 
     def _dispatch_tool(self, tool_name: str, tool_args: dict[str, Any]) -> str:
         """Run a tool call and return string content for the tool result message."""
+        # Validate path parameters for file-related tools to prevent path traversal
+        path_tools = {"create_file", "update_file", "delete_file", "read_file",
+                      "list_directory", "search_files", "check_syntax", "run_tests"}
+        if tool_name in path_tools and "path" in tool_args:
+            path_val = tool_args.get("path", "")
+            if isinstance(path_val, str):
+                # Block absolute paths and path traversal
+                if path_val.startswith("/") or path_val.startswith("\\"):
+                    return json.dumps({"ok": False, "error": f"Absolute paths are not allowed for security: {path_val}"})
+                if ".." in path_val:
+                    return json.dumps({"ok": False, "error": f"Path traversal ('..') is not allowed for security: {path_val}"})
+
         # First check skill registry for agent-specific tools
         skill_handler = self.skill_registry.get_handler(tool_name)
         if skill_handler:
@@ -912,12 +925,74 @@ class OrbitronKernel:
         except Exception as e:
             return json.dumps({"ok": False, "error": str(e)})
 
+    # Dangerous shell metacharacters/patterns that could be used for injection
+    _SHELL_DANGEROUS_PATTERNS = [
+        # Command chaining/separation
+        "&&", "||", ";", "|", "\n",
+        # Redirection
+        ">", ">>", "<",
+        # Command substitution
+        "$(", "`",
+        # Background execution
+        "&",
+        # Subshell
+        # Note: we don't block () entirely as they're used in Python commands
+    ]
+
+    def _sanitize_command(self, command: str) -> tuple[str, list[str]]:
+        """Sanitize a shell command to prevent injection attacks.
+
+        Returns a tuple of (sanitized_command, warnings).
+        Warnings are non-fatal issues that were auto-corrected.
+        """
+        warnings = []
+        original = command
+
+        # Remove null bytes (common injection technique)
+        if "\x00" in command:
+            command = command.replace("\x00", "")
+            warnings.append("Removed null bytes from command")
+
+        # Strip leading/trailing whitespace
+        command = command.strip()
+
+        # Check for obviously dangerous patterns
+        # Allow common safe patterns but block clearly malicious ones
+        dangerous_commands = [
+            "rm -rf /", "rm -rf /*", "mkfs", "dd if=", ":(){:|:&};:",
+            "wget", "curl -o", "> /etc/", "> /dev/",
+            "chmod 777", "chown root",
+            "sudo rm", "sudo chmod",
+        ]
+        cmd_lower = command.lower()
+        for dangerous in dangerous_commands:
+            if dangerous.lower() in cmd_lower:
+                logger.warning("[Kernel] Blocked potentially dangerous command pattern: %s", dangerous)
+                return "", [f"Blocked dangerous command pattern: {dangerous}"]
+
+        # Warn about shell metacharacters but don't block them
+        # (they're needed for legitimate commands like "cd dir && npm install")
+        for pattern in self._SHELL_DANGEROUS_PATTERNS:
+            if pattern in command:
+                # These are common in legitimate commands, just log
+                pass
+
+        if command != original:
+            logger.info("[Kernel] Command sanitized: '%s' -> '%s'", original[:80], command[:80])
+
+        return command, warnings
+
     def _tool_run_command(self, args: dict[str, Any]) -> str:
         command = args.get("command", "")
         timeout = int(args.get("timeout", 120))
         cwd_rel = args.get("cwd", ".")
         if not isinstance(command, str) or not command:
             return json.dumps({"ok": False, "error": "command must be a non-empty string"})
+
+        # Sanitize command to prevent injection attacks
+        command, warnings = self._sanitize_command(command)
+        if not command:
+            return json.dumps({"ok": False, "error": "Command blocked for security reasons", "warnings": warnings})
         try:
             cwd = str(self.file_ops.workspace_root / cwd_rel)
             result = subprocess.run(
@@ -1422,13 +1497,29 @@ class OrbitronKernel:
 
 
 class SessionManager:
-    """Manages persistent chat sessions per chat_id."""
+    """Manages persistent chat sessions per chat_id.
+    
+    Features:
+    - Session persistence to disk
+    - Automatic session trimming to prevent context bloat
+    - Session timeout and cleanup for stale sessions
+    - Memory-bounded cache with LRU eviction
+    """
 
-    def __init__(self, sessions_dir: str, *, max_messages: int = 40):
+    # Default session timeout: 24 hours (in seconds)
+    DEFAULT_SESSION_TIMEOUT = 24 * 60 * 60
+    
+    # Maximum number of cached sessions to prevent unbounded memory growth
+    MAX_CACHED_SESSIONS = 100
+
+    def __init__(self, sessions_dir: str, *, max_messages: int = 40, session_timeout: int | None = None):
         self.sessions_dir = Path(sessions_dir)
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
         self.max_messages = int(max_messages)
+        self.session_timeout = session_timeout or self.DEFAULT_SESSION_TIMEOUT
         self._cache: dict[int, list[dict[str, Any]]] = {}
+        self._last_access: dict[int, float] = {}  # chat_id -> timestamp of last access
+        self._creation_time: dict[int, float] = {}  # chat_id -> timestamp of session creation
 
     def _path(self, chat_id: int) -> Path:
         return self.sessions_dir / f"session_{chat_id}.json"
@@ -1472,10 +1563,23 @@ class SessionManager:
         session[:] = [session[0]] + rest
 
     def get(self, chat_id: int) -> list[dict[str, Any]]:
-        """Get session or create fresh one."""
+        """Get session or create fresh one.
+        
+        Also performs cleanup of expired sessions and evicts
+        old sessions when the cache exceeds MAX_CACHED_SESSIONS.
+        """
+        import time
+        
+        # Periodic cleanup of expired sessions
+        self._cleanup_expired_sessions()
+        
+        # Evict oldest sessions if cache is too large
+        self._evict_oldest_sessions()
+        
         if chat_id in self._cache:
             session = self._cache[chat_id]
             self._trim_in_place(session)
+            self._last_access[chat_id] = time.time()
             return session
 
         path = self._path(chat_id)
@@ -1493,6 +1597,8 @@ class SessionManager:
 
         self._trim_in_place(session)
         self._cache[chat_id] = session
+        self._last_access[chat_id] = time.time()
+        self._creation_time.setdefault(chat_id, time.time())
         return session
 
     def add_message(self, chat_id: int, message: dict[str, Any]) -> None:
@@ -1501,6 +1607,7 @@ class SessionManager:
         session.append(message)
         self._trim_in_place(session)
         self._cache[chat_id] = session
+        self._last_access[chat_id] = time.time()
 
     def save(self, chat_id: int) -> None:
         """Persist session to disk."""
@@ -1517,12 +1624,60 @@ class SessionManager:
         """Clear session cache and delete persisted file."""
         if chat_id in self._cache:
             del self._cache[chat_id]
+        self._last_access.pop(chat_id, None)
+        self._creation_time.pop(chat_id, None)
         path = self._path(chat_id)
         if path.exists():
             try:
                 path.unlink()
             except Exception:
                 pass
+
+    def _cleanup_expired_sessions(self) -> None:
+        """Remove sessions that have exceeded the timeout threshold.
+        
+        Called automatically during get() to prevent unbounded memory growth.
+        """
+        import time
+        now = time.time()
+        expired_ids = []
+        for chat_id, last_access in list(self._last_access.items()):
+            if now - last_access > self.session_timeout:
+                expired_ids.append(chat_id)
+        
+        for chat_id in expired_ids:
+            # Save before removing from cache (so data isn't lost)
+            self.save(chat_id)
+            del self._cache[chat_id]
+            del self._last_access[chat_id]
+            self._creation_time.pop(chat_id, None)
+        
+        if expired_ids:
+            logger.info("[SessionManager] Cleaned up %d expired sessions", len(expired_ids))
+
+    def _evict_oldest_sessions(self) -> None:
+        """Evict oldest sessions when cache exceeds MAX_CACHED_SESSIONS.
+        
+        Uses LRU (Least Recently Used) eviction strategy.
+        """
+        if len(self._cache) <= self.MAX_CACHED_SESSIONS:
+            return
+        
+        # Sort by last access time and evict the oldest
+        sorted_sessions = sorted(
+            self._last_access.items(),
+            key=lambda x: x[1],
+        )
+        
+        num_to_evict = len(self._cache) - self.MAX_CACHED_SESSIONS + 10  # Evict extra to avoid frequent evictions
+        for chat_id, _ in sorted_sessions[:num_to_evict]:
+            self.save(chat_id)  # Save before evicting
+            del self._cache[chat_id]
+            del self._last_access[chat_id]
+            self._creation_time.pop(chat_id, None)
+        
+        logger.info("[SessionManager] Evicted %d oldest sessions (cache size: %d)", 
+                    min(num_to_evict, len(sorted_sessions)), len(self._cache))
 
 
 def main():

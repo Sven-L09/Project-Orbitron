@@ -2,6 +2,16 @@
 
 Provides professional DOCX generation via Pandoc, using the
 OrbitronWordSystem template for consistent styling.
+
+Enhanced features:
+- Professional cover pages with title, subtitle, author, date
+- Table of contents (TOC)
+- Callout/admonition blocks (info, warning, tip, note)
+- Page breaks
+- YAML metadata for Pandoc (language, fonts, margins)
+- German date formatting
+- Image embedding with captions
+- Code blocks with syntax highlighting
 """
 
 import json
@@ -14,7 +24,17 @@ logger = logging.getLogger("Executor.WordSkill")
 
 
 class WordSkill(ExecutorSkill):
-    """Skill for word processing and document creation via Pandoc."""
+    """Skill for word processing and document creation via Pandoc.
+
+    Provides tools for creating professional Word documents with:
+    - Full Markdown formatting support
+    - Cover pages and metadata
+    - Table of contents
+    - Callout blocks (tips, warnings, notes)
+    - Page breaks
+    - Tables with alignment
+    - Code blocks with syntax highlighting
+    """
 
     def __init__(self, workspace: str | None = None):
         super().__init__(
@@ -50,7 +70,13 @@ class WordSkill(ExecutorSkill):
                 "description": (
                     "Create a professional Word document from Markdown content. "
                     "The content parameter accepts full Markdown formatting "
-                    "(headings, lists, tables, etc.) and produces a styled DOCX file."
+                    "(headings, lists, tables, etc.) and produces a styled DOCX file. "
+                    "Supports YAML metadata, cover pages, TOC, callouts, page breaks, "
+                    "and all advanced Markdown features. "
+                    "IMPORTANT: The generated document automatically includes professional "
+                    "headers (document title), footers (date + page numbers), proper TOC fields, "
+                    "and removes duplicate titles. You do NOT need to write custom Python scripts "
+                    "or use python-docx directly — this tool handles everything."
                 ),
                 "parameters": {
                     "type": "object",
@@ -67,12 +93,18 @@ class WordSkill(ExecutorSkill):
                                 "Supports headings (# H1, ## H2, etc.), "
                                 "bullet lists (- item), numbered lists (1. item), "
                                 "tables, bold (**text**), italic (*text*), "
+                                "callouts (> **💡 Tip** > content), "
+                                "page breaks (\\newpage), "
                                 "and all standard Markdown syntax."
                             ),
                         },
                         "title": {
                             "type": "string",
-                            "description": "Optional document title (used as Pandoc metadata)",
+                            "description": "Optional document title (used as Pandoc metadata and in header)",
+                        },
+                        "author": {
+                            "type": "string",
+                            "description": "Optional document author",
                         },
                     },
                 },
@@ -86,7 +118,14 @@ class WordSkill(ExecutorSkill):
                 "description": (
                     "Create a structured Word report with a title and multiple sections. "
                     "Each section has a heading and Markdown content. "
-                    "Produces a professionally styled DOCX file."
+                    "Produces a professionally styled DOCX file with cover page, "
+                    "table of contents, headers (document title), footers (date + page numbers), "
+                    "and proper formatting. "
+                    "IMPORTANT: The generated document automatically includes professional "
+                    "headers, footers, TOC fields, and removes duplicate titles. "
+                    "You do NOT need to write custom Python scripts or use python-docx directly — "
+                    "this tool handles everything. NEVER write a generate_doc.py script or use "
+                    "python-docx manually. Always use create_report or create_document instead."
                 ),
                 "parameters": {
                     "type": "object",
@@ -98,7 +137,7 @@ class WordSkill(ExecutorSkill):
                         },
                         "title": {
                             "type": "string",
-                            "description": "Report title",
+                            "description": "Report title (also used in document header)",
                         },
                         "sections": {
                             "type": "array",
@@ -108,8 +147,24 @@ class WordSkill(ExecutorSkill):
                                 "properties": {
                                     "heading": {"type": "string"},
                                     "content": {"type": "string"},
+                                    "level": {
+                                        "type": "integer",
+                                        "description": "Heading level (2=H2, 3=H3). Default: 2",
+                                    },
                                 },
                             },
+                        },
+                        "author": {
+                            "type": "string",
+                            "description": "Optional report author",
+                        },
+                        "subtitle": {
+                            "type": "string",
+                            "description": "Optional report subtitle",
+                        },
+                        "include_toc": {
+                            "type": "boolean",
+                            "description": "Whether to include a table of contents (default: true)",
                         },
                     },
                 },
@@ -127,6 +182,7 @@ class WordSkill(ExecutorSkill):
             filename = args.get("filename", "")
             content = args.get("content", "")
             title = args.get("title", "")
+            author = args.get("author", "")
 
             if not filename:
                 return json.dumps({"ok": False, "error": "Filename is required"})
@@ -149,6 +205,9 @@ class WordSkill(ExecutorSkill):
             filename = args.get("filename", "")
             title = args.get("title", "")
             sections = args.get("sections", [])
+            author = args.get("author", "")
+            subtitle = args.get("subtitle", "")
+            include_toc = args.get("include_toc", True)
 
             if not filename:
                 return json.dumps({"ok": False, "error": "Filename is required"})
@@ -158,6 +217,10 @@ class WordSkill(ExecutorSkill):
                 title=title,
                 sections=sections,
                 output_path=str(self._resolve_path(filename)),
+                author=author,
+                lang="de",
+                subtitle=subtitle,
+                include_toc=include_toc,
             )
             return json.dumps(result)
 

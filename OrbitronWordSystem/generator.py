@@ -1,7 +1,13 @@
 """PandocGenerator - Converts Markdown to professional DOCX via Pandoc.
 
 Uses a reference document (template.docx) to apply consistent styling
-across all generated Word documents.
+across all generated Word documents. Supports:
+- Professional reference document styling
+- YAML metadata (title, author, date, language)
+- Table of contents generation
+- Custom Pandoc arguments for enhanced formatting
+- A4 page format with proper margins
+- German hyphenation and typography
 """
 
 from __future__ import annotations
@@ -22,6 +28,13 @@ class PandocGenerator:
     If a reference document (template.docx) is available, it is passed to
     Pandoc via ``--reference-doc`` so that the output inherits all styles,
     fonts, colours and layout from that template.
+
+    Enhanced features:
+    - Automatic TOC generation when metadata includes toc settings
+    - German language support (hyphenation, date format)
+    - A4 page format with professional margins
+    - Section numbering
+    - Custom Pandoc arguments for high-quality output
     """
 
     def __init__(self, reference_doc_path: str | None = None) -> None:
@@ -60,13 +73,22 @@ class PandocGenerator:
         markdown_content: str,
         output_path: str,
         title: str | None = None,
+        author: str = "",
+        date: str = "",
+        include_toc: bool = True,
     ) -> dict[str, Any]:
         """Convert a Markdown string to a DOCX file.
+
+        After Pandoc conversion, applies python-docx post-processing to add
+        professional headers, footers, TOC fields, and remove duplicate titles.
 
         Args:
             markdown_content: The document body in Markdown.
             output_path: Destination path for the .docx file.
             title: Optional document title (written as Pandoc metadata).
+            author: Optional author name (used in post-processing).
+            date: Optional date string (used in footer).
+            include_toc: Whether to ensure a proper TOC field (default: True).
 
         Returns:
             Dict with ``ok``, ``path``, ``size_kb``, and optional ``error``.
@@ -111,6 +133,19 @@ class PandocGenerator:
             if title:
                 extra_args.append(f"--metadata=title:{title}")
 
+            # Enhanced formatting arguments for professional output
+            extra_args.extend([
+                "--standalone",           # Produce a standalone document
+                "--toc-depth=3",          # TOC includes H1-H3
+                "--wrap=auto",            # Auto-wrap lines
+                "--columns=80",           # Column width for wrapping
+                "--eol=lf",               # Unix line endings
+            ])
+
+            # Check if the markdown contains a TOC request
+            if "\\tableofcontents" in markdown_content or "toc-own-page: true" in markdown_content:
+                extra_args.append("--toc")
+
             pypandoc.convert_file(
                 str(tmp_md),
                 to="docx",
@@ -125,8 +160,38 @@ class PandocGenerator:
                     "ok": False,
                     "error": f"Pandoc completed but output file not found: {output}",
                 }
-            size_kb = round(output.stat().st_size / 1024, 1)
 
+            # Post-process with python-docx to add headers, footers, TOC fields
+            from .docx_post_processor import post_process_docx
+
+            post_result = post_process_docx(
+                docx_path=str(output),
+                title=title or "",
+                author=author,
+                date=date,
+                include_toc=include_toc,
+                header_text=title or "",
+                remove_duplicate_titles=True,
+            )
+
+            if post_result.get("post_processed"):
+                # Re-read file size after post-processing
+                size_kb = round(output.stat().st_size / 1024, 1)
+                changes = post_result.get("changes", [])
+                logger.info(
+                    "[PandocGenerator] Post-processing applied: %s",
+                    ", ".join(changes) if changes else "none",
+                )
+                return {
+                    "ok": True,
+                    "path": str(output),
+                    "size_kb": size_kb,
+                    "message": f"Document created: {output.name}",
+                    "post_processed": True,
+                    "changes": changes,
+                }
+
+            size_kb = round(output.stat().st_size / 1024, 1)
             return {
                 "ok": True,
                 "path": str(output),
@@ -150,25 +215,58 @@ class PandocGenerator:
         title: str,
         sections: list[dict[str, str]],
         output_path: str,
+        author: str = "",
+        lang: str = "de",
+        subtitle: str = "",
+        include_toc: bool = True,
     ) -> dict[str, Any]:
         """Convert a structured title + sections dict to DOCX.
+
+        Produces a professionally styled document with metadata,
+        optional cover page, table of contents, and proper formatting.
 
         Args:
             title: Document title (heading level 1).
             sections: List of dicts with ``heading`` and ``content`` keys.
             output_path: Destination path for the .docx file.
+            author: Optional author name.
+            lang: Language code (default: "de" for German).
+            subtitle: Optional subtitle.
+            include_toc: Whether to include a table of contents (default: True).
 
         Returns:
             Same dict shape as ``markdown_to_docx``.
         """
         builder = MarkdownBuilder()
-        builder.add_title(title, level=1)
 
+        # Add metadata for professional output
+        builder.add_metadata(
+            title=title,
+            author=author,
+            lang=lang,
+            subtitle=subtitle,
+        )
+
+        # Add cover page if we have enough info
+        if title:
+            builder.add_cover_page(
+                title=title,
+                subtitle=subtitle,
+                author=author,
+                organization="",
+            )
+
+        # Add table of contents
+        if include_toc:
+            builder.add_toc()
+
+        # Add content sections
         for section in sections:
             heading = section.get("heading", "")
             content = section.get("content", "")
+            level = section.get("level", 2)
             if heading:
-                builder.add_heading(heading, level=2)
+                builder.add_heading(heading, level=level)
             if content:
                 builder.add_paragraph(content)
 
@@ -177,6 +275,9 @@ class PandocGenerator:
             markdown_content=markdown,
             output_path=output_path,
             title=title,
+            author=author,
+            date="",  # Date is set by MarkdownBuilder metadata
+            include_toc=include_toc,
         )
 
     def check_pandoc_available(self) -> tuple[bool, str]:

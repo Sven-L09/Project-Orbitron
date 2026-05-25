@@ -30,9 +30,18 @@ class TelegramClient:
             return []
         return [u for u in result if isinstance(u, dict)]
 
-    def send_message(self, chat_id: int, text: str) -> None:
+    def send_message(self, chat_id: int, text: str, parse_mode: str | None = None) -> None:
+        """Send a text message to a Telegram chat.
+
+        Args:
+            chat_id: Target chat ID
+            text: Message text to send
+            parse_mode: Optional parse mode ('MarkdownV2', 'HTML', 'Markdown')
+        """
         url = f"{self.base_url}/bot{self.token}/sendMessage"
-        payload = {"chat_id": chat_id, "text": text}
+        payload: dict[str, Any] = {"chat_id": chat_id, "text": text}
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
         resp = requests.post(url, json=payload, timeout=(10, 30))
         resp.raise_for_status()
         data = resp.json()

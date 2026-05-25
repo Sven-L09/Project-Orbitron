@@ -13,7 +13,7 @@ from typing import Any, Callable, Optional, Union
 import requests
 
 from TelegramBot.telegram_client import TelegramClient
-from TelegramBot.text import split_telegram_text
+from TelegramBot.text import split_telegram_text, format_markdown_v2
 
 logger = logging.getLogger("TelegramBot")
 
@@ -29,8 +29,23 @@ class ResponseSender:
         self._telegram = telegram
         self._chat_id = chat_id
 
-    def send_text(self, msg: str) -> None:
-        """Send a text message (auto-splits long messages)."""
+    def send_text(self, msg: str, use_markdown: bool = False) -> None:
+        """Send a text message (auto-splits long messages).
+
+        Args:
+            msg: The message text to send
+            use_markdown: If True, format the message using Telegram MarkdownV2
+        """
+        if use_markdown:
+            try:
+                formatted = format_markdown_v2(msg)
+                for chunk in split_telegram_text(formatted):
+                    self._telegram.send_message(self._chat_id, chunk, parse_mode="MarkdownV2")
+                return
+            except Exception as e:
+                logger.warning("[Telegram] MarkdownV2 formatting failed, falling back to plain text: %s", e)
+                # Fall through to plain text
+
         for chunk in split_telegram_text(msg):
             self._telegram.send_message(self._chat_id, chunk)
 
@@ -100,6 +115,14 @@ class TelegramBotService:
 
         if command == "/queue":
             self._cmd_queue(chat_id, username, send)
+            return True
+
+        if command == "/cancel":
+            self._cmd_cancel(chat_id, username, send)
+            return True
+
+        if command == "/help":
+            self._cmd_help(chat_id, username, send)
             return True
 
         return False
@@ -258,6 +281,57 @@ class TelegramBotService:
 
         send("\n".join(lines))
 
+    def _cmd_cancel(self, chat_id: int, username: str, send: Callable[[str], None]) -> None:
+        """Handle /cancel command — cancel the current task for this user."""
+        logger = logging.getLogger("TelegramBot")
+        logger.info(f"[Telegram] /cancel command from {username}")
+
+        service = self._get_service_system()
+        if not service:
+            send("⚠️ Service nicht verfügbar.")
+            return
+
+        # Try to cancel the current task in the task queue
+        if hasattr(service, '_task_queue'):
+            cancelled = service._task_queue.cancel_task_for_chat(chat_id)
+            if cancelled:
+                send(f"✅ Task abgebrochen: {cancelled.get('description', '?')[:60]}")
+            else:
+                send("ℹ️ Kein aktiver Task zum Abbrechen.")
+        else:
+            send("⚠️ Task Queue nicht verfügbar.")
+
+    def _cmd_help(self, chat_id: int, username: str, send: Callable[[str], None]) -> None:
+        """Handle /help command — show available commands."""
+        help_text = (
+            "🤖 *Orbitron Bot — Befehle*\n\n"
+            "/status — Systemstatus anzeigen\n"
+            "/queue — Task-Warteschlange anzeigen\n"
+            "/cancel — Aktuellen Task abbrechen\n"
+            "/reset — Gesprächskontext zurücksetzen\n"
+            "/restart — System neu starten\n"
+            "/help — Diese Hilfe anzeigen\n\n"
+            "Tippe einfach eine Nachricht, um einen Task zu starten."
+        )
+        send(help_text)
+
+    def send_progress(self, chat_id: int, message: str) -> None:
+        """Send a progress update to a specific chat.
+
+        Used by ServiceSystem to send intermediate status updates
+        during long-running tasks (e.g., "Executor arbeitet... 3/10 Schritte").
+
+        Args:
+            chat_id: The Telegram chat ID to send the update to
+            message: The progress message to send
+        """
+        try:
+            for chunk in split_telegram_text(message):
+                self.telegram.send_message(chat_id, chunk)
+            logger.info(f"[Telegram] Progress update sent to chat_id={chat_id}: {message[:60]}...")
+        except Exception as e:
+            logger.warning(f"[Telegram] Failed to send progress update: {e}")
+
     def _get_service_system(self):
         """Get the ServiceSystem instance."""
         return self.service_system
@@ -325,6 +399,17 @@ class TelegramBotService:
                     user = message.get("from") or {}
                     username = user.get("username") or user.get("first_name") or "user"
 
+                    # Extract reply context from Telegram's reply_to_message feature
+                    reply_context = None
+                    reply_to = message.get("reply_to_message")
+                    if isinstance(reply_to, dict):
+                        reply_text = reply_to.get("text", "")
+                        reply_from_dict = reply_to.get("from") or {}
+                        reply_from = reply_from_dict.get("username") or reply_from_dict.get("first_name") or ""
+                        if reply_text:
+                            reply_context = "[Antwort auf Nachricht von " + reply_from + ": " + reply_text[:500] + "]"
+                            logger.info("[Telegram] Reply context: " + reply_context[:100] + "...")
+
                     logger.info(f"[Telegram] Message from {username} (chat_id={chat_id}): {text[:60]}...")
 
                     sender = ResponseSender(self.telegram, chat_id)
@@ -339,27 +424,35 @@ class TelegramBotService:
                         if self.message_handler:
                             logger.info(f"[Telegram] Routing to ServiceSystem handler for task processing")
                             try:
-                                answer = self.message_handler(text, chat_id, username, sender)
+                                answer = self.message_handler(text, chat_id, username, sender, reply_context=reply_context)
                             except TypeError:
-                                # Backwards compatibility for 3-arg handlers (no sender)
+                                # Try without reply_context for backward compatibility
                                 try:
-                                    answer = self.message_handler(text, chat_id, username)
+                                    answer = self.message_handler(text, chat_id, username, sender)
                                 except TypeError:
-                                    # 2-arg handler (text, chat_id)
-                                    answer = self.message_handler(text, chat_id)
-                                # Handler didn't get sender, so we send the answer ourselves
-                                if isinstance(answer, list):
-                                    for msg in answer:
-                                        sender(msg)
-                                elif isinstance(answer, str) and answer:
-                                    sender(answer)
-                                total_len = sum(len(m) for m in answer) if isinstance(answer, list) else len(answer or "")
+                                    # Backwards compatibility for 3-arg handlers (no sender)
+                                    try:
+                                        answer = self.message_handler(text, chat_id, username)
+                                    except TypeError:
+                                        # 2-arg handler (text, chat_id)
+                                        answer = self.message_handler(text, chat_id)
+                                    # Handler didn't get sender, so we send the answer ourselves
+                                    if isinstance(answer, list):
+                                        for msg in answer:
+                                            sender(msg)
+                                    elif isinstance(answer, str) and answer:
+                                        sender(answer)
+                                    total_len = sum(len(m) for m in answer) if isinstance(answer, list) else len(answer or "")
+                                else:
+                                    # Handler received sender — it already sent via sender callback
+                                    total_len = len(answer or "")
                             else:
-                                # Handler received sender — it already sent via sender callback
+                                # Handler received sender and reply_context — it already sent via sender callback
                                 total_len = len(answer or "")
                         else:
                             # Use Orchestrator with session memory (includes personality & context)
-                            answer = bridge.chat_with_session(f"[{username}] {text}", chat_id=chat_id)
+                            full_text = f"{text}\n{reply_context}" if reply_context else text
+                            answer = bridge.chat_with_session(f"[{username}] {full_text}", chat_id=chat_id)
                             if isinstance(answer, list):
                                 for msg in answer:
                                     sender(msg)
@@ -380,12 +473,27 @@ class TelegramBotService:
                 if e.response is not None and e.response.status_code == 409:
                     logger.warning("[Telegram] 409 Conflict - another bot instance may be running. Waiting 10s...")
                     time.sleep(10.0)
+                elif e.response is not None and e.response.status_code == 429:
+                    # Rate limited - use Retry-After header if available
+                    retry_after = int(e.response.headers.get("Retry-After", "30"))
+                    logger.warning("[Telegram] 429 Rate Limited - waiting %ds (Retry-After header)", retry_after)
+                    time.sleep(min(retry_after, 60))
                 else:
                     logger.exception("[Telegram] HTTP error: %s", e)
                     time.sleep(self.sleep_on_error_s)
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                # Network errors - exponential backoff
+                self._consecutive_errors = getattr(self, '_consecutive_errors', 0) + 1
+                backoff = min(2 ** self._consecutive_errors, 60)  # Max 60s backoff
+                logger.warning("[Telegram] Network error (attempt %d): %s - backing off %ds",
+                             self._consecutive_errors, e, backoff)
+                time.sleep(backoff)
             except Exception as e:
                 logger.exception("[Telegram] Bot loop error: %s", e)
                 time.sleep(self.sleep_on_error_s)
+            else:
+                # Reset error counter on success
+                self._consecutive_errors = 0
 
     def _offset_path(self) -> Path:
         root = Path.home() / ".orbitron"

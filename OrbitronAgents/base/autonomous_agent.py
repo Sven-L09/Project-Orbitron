@@ -73,7 +73,12 @@ class AutonomousAgent:
         "URGENT: You are running out of rounds. You MUST call your submit/terminal tool NOW. "
         "Do NOT make any more tool calls. Submit your current result immediately."
     )
-
+    # Early urgency message injected when agent is reading too much without writing
+    EARLY_URGENCY_MESSAGE = (
+        "WARNING: You have been reading files for several rounds without creating or modifying anything. "
+        "STOP reading and START writing NOW. Create at least one file before you run out of rounds. "
+        "Partial work submitted is better than no work at all."
+    )
     def __init__(
         self,
         agent_name: str,
@@ -560,6 +565,13 @@ class AutonomousAgent:
                 self._logger.warning("[%s] Injecting urgency message at round %d (threshold=%d)",
                                      self.agent_name, round_num + 1, urgency_round)
                 messages.append({"role": "user", "content": self.URGENCY_MESSAGE})
+
+            # Inject early urgency if agent is reading too much without writing
+            # Check at round 5 and 8: if no file operations have been performed, warn
+            if round_num + 1 in (5, 8) and not self._file_operations:
+                self._logger.warning("[%s] Injecting early urgency at round %d — no file operations yet",
+                                     self.agent_name, round_num + 1)
+                messages.append({"role": "user", "content": self.EARLY_URGENCY_MESSAGE})
 
             # Inject final urgency message at 2 rounds before the end
             final_round = max_rounds - 1

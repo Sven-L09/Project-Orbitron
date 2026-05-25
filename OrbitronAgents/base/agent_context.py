@@ -1,11 +1,14 @@
 """Context management for Orbitron agents."""
 
 import json
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum, auto
 from pathlib import Path
 from typing import Any, Optional
+
+logger = logging.getLogger("AgentContext")
 
 
 class ContextScope(Enum):
@@ -173,6 +176,23 @@ class AgentContext:
             k for k, e in self._entries.items()
             if not e.is_expired() and (scope is None or e.scope == scope)
         ]
+
+    def garbage_collect(self) -> int:
+        """Remove all expired entries from the context.
+        
+        Unlike get() which only removes entries on access, this method
+        proactively scans and removes all expired entries.
+        
+        Returns:
+            Number of entries removed.
+        """
+        expired_keys = [k for k, e in self._entries.items() if e.is_expired()]
+        for key in expired_keys:
+            del self._entries[key]
+        if expired_keys:
+            logger.info("[AgentContext] Garbage collected %d expired entries for %s", 
+                       len(expired_keys), self.agent_name)
+        return len(expired_keys)
 
     # ========== Persistence ==========
 
